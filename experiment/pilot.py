@@ -82,6 +82,10 @@ def cmd_collect(args, config, device):
                     chunk = student.sample(noise_t, cond)
             chunk_n = chunk.detach().cpu().numpy()[0]
             physical = adapter.decode(chunk_n[:config["execute_steps"]])
+            student_mid = None
+            if student is not None:
+                with torch.no_grad():
+                    student_mid = student(noise_t, cond, 0.0).detach().cpu().numpy()[0]
             context = None
             if len(history) % 2 == 0 and len(record["contexts"]) < config["contexts_per_episode"]:
                 if history:
@@ -92,7 +96,8 @@ def cmd_collect(args, config, device):
                     signature = None
                 context = {"condition": cond.detach().cpu().numpy()[0], "noise": noise[0],
                            "history": [list(map(float, row)) for row in history],
-                           "signature": signature, "scene": scene}
+                           "signature": signature, "scene": scene,
+                           "student_mid": None if student_mid is None else student_mid.tolist()}
                 record["contexts"].append(context)
             for action in physical:
                 obs, _, done, _ = adapter.step(env, action)
@@ -111,7 +116,7 @@ def cmd_collect(args, config, device):
 
 
 def cmd_metrics(args, config, device):
-    from hri_adapter import teacher_half_maps, teacher_rollout
+    from hri_adapter import teacher_half_from, teacher_half_maps
     adapter = build_adapter(config, device)
     cache = np.load(args.cache, allow_pickle=True)
     records = cache["records"]
@@ -126,16 +131,20 @@ def cmd_metrics(args, config, device):
     for context in contexts:
         cond = torch.from_numpy(np.asarray(context["condition"], dtype=np.float32)).unsqueeze(0).to(device)
         noise = torch.from_numpy(np.asarray(context["noise"], dtype=np.float32)).unsqueeze(0).to(device)
+        if context.get("student_mid") is None:
+            raise ValueError("shared cache lacks warm student midpoint, recollect with student cache")
+        student_mid = torch.from_numpy(np.asarray(context["student_mid"], dtype=np.float32)).unsqueeze(0).to(device)
         with torch.no_grad():
-            half_mid, half_end = teacher_half_maps(adapter.noise_pred_net, noise, cond, steps)
-            teacher_end = teacher_rollout(adapter.noise_pred_net, noise, cond, steps)
-            teacher_midpoint_end = teacher_rollout(adapter.noise_pred_net, half_mid.detach(), cond, steps)
+            teacher_mid, _ = teacher_half_maps(adapter.noise_pred_net, noise, cond, steps)
+            y0 = teacher_mid.detach()
+            endpoint = teacher_half_from(y0, adapter.noise_pred_net, cond, steps).detach()
+            second = teacher_half_from(student_mid, adapter.noise_pred_net, cond, steps).detach()
         history = [np.asarray(row, dtype=np.float64) for row in context["history"]]
         scene = int(context["scene"])
         if context["signature"] is not None:
             adapter.check_replay(scene, history, np.asarray(context["signature"]))
-        prefix_a = teacher_end.detach().cpu().numpy()[0][:config["execute_steps"]]
-        prefix_b = teacher_midpoint_end.detach().cpu().numpy()[0][:config["execute_steps"]]
+        prefix_a = endpoint.detach().cpu().numpy()[0][:config["execute_steps"]]
+        prefix_b = second.detach().cpu().numpy()[0][:config["execute_steps"]]
         branches = {}
         for tag, prefix in (("start", prefix_a), ("end", prefix_b)):
             jac = finite_difference_jacobian(
@@ -145,19 +154,19 @@ def cmd_metrics(args, config, device):
                 lambda chunk, _scene=scene, _history=history: adapter.execute_from_history(_scene, _history, chunk),
                 prefix, epsilon=eps)
             branches[tag] = (jac, float(np.abs(jac - dup).max()))
-        suffix_target = half_mid.detach()
+        suffix_target = y0
         jac_start = torch.from_numpy(branches["start"][0].astype(np.float32)).unsqueeze(0).to(device)
 
         def suffix(variable):
-            return teacher_rollout(adapter.noise_pred_net, variable, cond, steps)
+            return teacher_half_from(variable, adapter.noise_pred_net, cond, steps)
 
         probes = pullback_probes(suffix, suffix_target, jac_start,
                                  config["execute_steps"], num_probes=config["num_probes"]).detach().cpu().numpy()[0]
         out.append({"condition": context["condition"], "noise": context["noise"],
-                    "midpoint": half_mid.detach().cpu().numpy()[0],
-                    "target_mid": half_end.detach().cpu().numpy()[0],
-                    "target_end": teacher_midpoint_end.detach().cpu().numpy()[0],
-                    "teacher_end": teacher_end.detach().cpu().numpy()[0],
+                    "midpoint": student_mid.detach().cpu().numpy()[0],
+                    "target_mid": y0.detach().cpu().numpy()[0],
+                    "target_end": second.detach().cpu().numpy()[0],
+                    "teacher_end": endpoint.detach().cpu().numpy()[0],
                     "jacobian_start": branches["start"][0].astype(np.float32),
                     "jacobian_end": branches["end"][0].astype(np.float32),
                     "probes": probes.astype(np.float32),

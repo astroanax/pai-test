@@ -28,6 +28,7 @@ setup, run relative to execution-pullback/
 - weights_only tensor checkpoint loading, strict key and shape checks
 
 audit record, static only, nothing executed
+- label fix: collect now saves warm student midpoint ztilde, metrics sets midpoint ztilde, target_mid y0 half map, target_end y1 second half from ztilde, teacher_end at second half from y0, suffix is half map 0.5 to 1, prefixes from at and y1
 - appendix randint bound 140 corrected to 0, 2
 - teacher_half_maps parameterized by step count instead of hardcoded 8 plus 8
 - metrics path dead code removed, suffix closure uses configured step count
