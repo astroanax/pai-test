@@ -1,31 +1,22 @@
 {
+  "schema_version": 2,
   "experiment": "execution-pullback",
   "dir": "/home/rehan/workspaces/project-i/execution-pullback/experiment",
   "files": {
-    "core.py": "a2ff292454fa0f2a3912d946c53d8bf003c92921498e1ca03032f3146b873518",
-    "hri_adapter.py": "f573de42bfdde6258fbcb19237cf90773a4383544bddb357494d4f1fa3671d56",
-    "pilot.py": "45d04c33b63886fc6e8e70e92e312fdaf964a87baeefda62cfb1a3999f2bffe0",
-    "diagnose.py": "ab0c09a84d0dc447143f5c2e9ac8e44ec39f8e753901641ed4de43097164e762",
-    "analyze.py": "8a8214c1df93274ea0b9533d972e0bdd696307e1e284d7c9524d1960c012be42",
-    "sanity.py": "58bb67e9a8c3f92522666bfe23aae196f29337dc0a917c59ba2ee95447f036b8",
-    "preflight.py": "8984c4938b7da5845b9e21afeac810f176cff0b55913a912df95f2473c132903",
-    "lock_protocol.py": "91126b1102e05676613490a964b3a354985ba986721c5706dbdb516307f512b6",
-    "contract.py": "ee7437c3168c950f7fe2e774731108782069b25c4ee63b6e794871c3efda6333",
-    "smoke.py": "fdf45894c0eb49d478e5741e28ef33e5dcfe25db7cf7bc69aaf4b611f74121b7",
-    "run_comparison.sh": "d417a300d09816637c76bc5286b3fba8886a9a82321b2498b669439289410967",
-    "config.json": "922ebf79cd0f6a95b52e053105123855c739f0ff662881c12232b4b03b11b2ea"
+    "core.py": "b645151a2b94cc88ebf8447bee004605ddf13b05d1e8801be0d860b4ad5f2b69",
+    "hri_adapter.py": "738760de579c82dc01779711cb51a8976c2b21bc4b69c80c7f73d8613c312810",
+    "pilot.py": "c3e66f089a0185d9ef05253dbc8e44231d6d37b47c83618aa6d157ea25274b48",
+    "diagnose.py": "b89b52b58d1e266e21902ec73f3d7f9efc5743ff8d89cf881e1ff37302d5f218",
+    "analyze.py": "a125c426f41fc17d59150f4c3cfd6741ef6c6674953f448fc3d4eab28216d714",
+    "sanity.py": "cda00f85ab34b7a12e9c59fcbd34b0a47ea39f5381ed9b0b625ef44a79471861",
+    "preflight.py": "8cb773a8003b00e07fc6b1a426234e1d82f492a166439d28ebc1d33f259ebc69",
+    "lock_protocol.py": "0b24c6844987be090fc18cd7ea1577d43299858d7a37d77d0e547bc4e9397803",
+    "contract.py": "120930d88940b2a1c5119a6962be59d70cc68c7ccc48db3388fb2f0feac5c2be",
+    "smoke.py": "89e132eac5fb0300f3896aa47c0ae55a0bb2f32ca322209d357a97467fd7a44b",
+    "run_comparison.sh": "4c5a1dd774935e0816116a599cd601a265decbc4a1ef4b2ebe6a444a013293b1",
+    "config.json": "a7b2adfc685a40479ec645733f868cb7112b8e35c13d8ee7c57b3228206de9d8"
   },
   "count": 12,
-  "upstream": {
-    "/home/rehan/workspaces/project-i/execution-pullback/external/flow_matching/external/models/unet.py": "absent",
-    "/home/rehan/workspaces/project-i/execution-pullback/external/flow_matching/external/models/resnet.py": "absent",
-    "/home/rehan/workspaces/project-i/execution-pullback/external/flow_matching/external/models/pusht.py": "absent"
-  },
-  "required_from_upstream": [
-    "external/models/unet.py",
-    "external/models/resnet.py",
-    "external/models/pusht.py"
-  ],
   "packages": {
     "torch": "missing: No module named 'torch'",
     "torchvision": "missing: No module named 'torchvision'",

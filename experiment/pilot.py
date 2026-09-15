@@ -9,8 +9,9 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import contract as C
-from core import (TwoStepStudent, finite_difference_jacobian, metric_scales,
-                  objective, pullback_metric_exact, pullback_probes,
+from core import (METRIC_MODES, finite_difference_jacobian, make_student,
+                  metric_scales, mode_needs_metric, objective,
+                  pullback_metric_exact, pullback_probes, sample_source,
                   sample_with_midpoint)
 from hri_adapter import (HRIAdapter, load_checkpoint, resolve_device,
                          teacher_half_from, teacher_half_maps, teacher_rollout)
@@ -23,14 +24,6 @@ def load_config(path):
     return config
 
 
-def sample_source(rng, shape, source):
-    if source == "gaussian":
-        return rng.standard_normal(shape).astype(np.float32)
-    if source == "uniform":
-        return (rng.random(shape).astype(np.float32) * 2 - 1)
-    raise ValueError("unknown source distribution")
-
-
 def build_adapter(config, device):
     stats = {key: {inner: np.asarray(val) for inner, val in section.items()}
              for key, section in np.load(config["normalizer"], allow_pickle=True)["stats"].item().items()}
@@ -41,247 +34,296 @@ def build_adapter(config, device):
 
 
 def load_student(path, config, device):
-    """Load a student checkpoint and return (student, payload). The intrinsic
-    mode and seed are read from the checkpoint, never from the CLI label."""
     payload = torch.load(path, map_location=device, weights_only=True)
     if not isinstance(payload, dict) or "student" not in payload:
         raise ValueError("checkpoint lacks a student state dict")
-    for key in ("mode", "seed"):
+    for key in ("mode", "seed", "updates"):
         if key not in payload:
             raise ValueError(f"checkpoint lacks intrinsic {key}")
-    student = TwoStepStudent(condition_dim=514, horizon=16, action_dim=2,
-                             width=config["width"]).to(device)
-    student.load_state_dict(payload["student"])
+    student = make_student(config, device, seed=None,
+                           state_dict=payload["student"])
     for tensor in student.state_dict().values():
         if not torch.isfinite(tensor).all():
             raise ValueError("nonfinite student checkpoint tensor")
     return student, payload
 
 
-def resolve_protocol_id(args, config, device):
-    """Recheck the locked protocol before evaluation and analysis."""
-    path = getattr(args, "protocol", None) or "runs/protocol_locked.json"
-    if not os.path.exists(path):
-        return None, None
-    protocol = C.require_protocol(path)
+def protocol_for(args, config):
+    """Load the lock and revalidate every fingerprint against the current tree.
+
+    Unlocked execution is permitted only for explicitly designated development
+    stages (`--allow-unlocked`), never for final evaluation or analysis.
+    """
+    path = getattr(args, "protocol", None)
+    if not path:
+        if getattr(args, "allow_unlocked", False):
+            return None, None
+        raise C.ProtocolError(
+            f"{args.command}: pass --protocol runs/protocol_locked.json, or "
+            "--allow-unlocked for a development stage")
+    protocol = C.load_protocol(path)
+    C.verify_current_protocol(protocol, config, args.config,
+                              stage=args.command)
     return protocol, protocol.get("protocol_id")
 
 
 def cmd_normalizer(args, config, device):
     import zarr
-    output = args.output
-    C.reserve_outputs([output, output + ".meta.json"])
-    store = zarr.open(args.dataset, "r")
-    action = np.asarray(store["data"]["action"][:], dtype=np.float64).reshape(-1, 2)
-    state = np.asarray(store["data"]["state"][:, :2], dtype=np.float64).reshape(-1, 2)
-    if not (np.isfinite(action).all() and np.isfinite(state).all()):
-        raise ValueError("non-finite values in the demonstration archive")
-    stats = {"action": {"min": action.min(0).tolist(), "max": action.max(0).tolist()},
-             "agent_pos": {"min": state.min(0).tolist(), "max": state.max(0).tolist()}}
-    C.verify_tensors({k: np.array([v["min"], v["max"]]) for k, v in stats.items()},
-                     "normalizer")
-    C.atomic_savez(output, stats=stats)
-    C.write_meta(output + ".meta.json",
-                 dict(kind="normalizer", dataset=args.dataset,
-                      source_hashes=C.source_hashes(), stats=stats))
-    print("wrote normalizer " + output)
+
+    def produce():
+        store = zarr.open(args.dataset, "r")
+        action = np.asarray(store["data"]["action"][:], dtype=np.float64).reshape(-1, 2)
+        state = np.asarray(store["data"]["state"][:, :2], dtype=np.float64).reshape(-1, 2)
+        if not (np.isfinite(action).all() and np.isfinite(state).all()):
+            raise ValueError("non-finite values in the demonstration archive")
+        stats = {"action": {"min": action.min(0).tolist(), "max": action.max(0).tolist()},
+                 "agent_pos": {"min": state.min(0).tolist(), "max": state.max(0).tolist()}}
+        C.verify_tensors({k: np.array([v["min"], v["max"]]) for k, v in stats.items()},
+                         "normalizer")
+        C.atomic_savez(args.output, stats=stats)
+        C.write_meta(args.output + ".meta.json",
+                     dict(kind="normalizer", schema_version=C.SCHEMA_VERSION,
+                          dataset=args.dataset, stats=stats,
+                          source_hashes=C.source_hashes()))
+        print("wrote normalizer " + args.output)
+        return dict(kind="normalizer", dataset=args.dataset)
+
+    produce()
+
+
+def _collect_episode(adapter, config, device, scene, student, rng, split,
+                     source, decision_limit):
+    """One episode with live signatures and saved teacher targets."""
+    record = {"scene": scene, "split": split, "contexts": []}
+    env = adapter.new_env(image=True)
+    obs, _ = adapter.reset(env, scene)
+    initial_signature = [float(v) for v in adapter.signature(env).tolist()]
+    history = []
+    done = False
+    steps = 0
+    decision = 0
+    while not done and steps < config["episode_steps"]:
+        cond = adapter.encode_observation(obs["image"], obs["agent_pos"])
+        noise_np = sample_source(rng, (1, 16, 2), source)
+        noise_t = torch.from_numpy(noise_np).to(device)
+        # live signature before executing the next chunk (never a replay)
+        live_signature = [float(v) for v in adapter.signature(env).tolist()]
+        keep = (decision % 2 == 0
+                and len(record["contexts"]) < config["contexts_per_episode"])
+        with torch.no_grad():
+            if student is None:
+                # the teacher IS the behaviour policy; the half map supplies the
+                # behaviour chunk and its own targets with no discarded work
+                y0, behavior = teacher_half_maps(adapter.noise_pred_net, noise_t,
+                                                 cond, config["teacher_steps"])
+                student_mid = None
+                target_mid = y0
+                target_end = behavior
+                teacher_end = behavior
+            else:
+                behavior, midpoint = sample_with_midpoint(noise_t, cond, student)
+                student_mid = midpoint.detach()
+                y0, _ = teacher_half_maps(adapter.noise_pred_net, noise_t, cond,
+                                          config["teacher_steps"])
+                teacher_end = teacher_half_from(y0, adapter.noise_pred_net, cond,
+                                                config["teacher_steps"])
+                target_mid = y0
+                # y1 is the teacher answer at the STUDENT's own midpoint
+                target_end = teacher_half_from(student_mid, adapter.noise_pred_net,
+                                               cond, config["teacher_steps"])
+        context = None
+        if keep:
+            context = {"scene": scene, "split": split, "decision": decision,
+                       "step": steps,
+                       "condition": cond.detach().cpu().numpy()[0],
+                       "noise": noise_np[0],
+                       "midpoint": (student_mid.detach().cpu().numpy()[0]
+                                    if student_mid is not None
+                                    else y0.detach().cpu().numpy()[0]),
+                       "target_mid": target_mid.detach().cpu().numpy()[0],
+                       "target_end": target_end.detach().cpu().numpy()[0],
+                       "teacher_end": teacher_end.detach().cpu().numpy()[0],
+                       "history": [list(map(float, row)) for row in history],
+                       "signature_initial": initial_signature,
+                       "signature_live": live_signature}
+            record["contexts"].append(context)
+        prepared = adapter.prepare_commands(behavior.detach().cpu().numpy()[0][:config["execute_steps"]])
+        for action in prepared["prepared"]:
+            obs, _, done, _ = adapter.step(env, action)
+            history.append([float(value) for value in np.asarray(action).tolist()])
+            steps += 1
+            if done or steps >= config["episode_steps"]:
+                break
+        if context is not None:
+            context["history_end"] = [list(map(float, row)) for row in history]
+        decision += 1
+        if decision_limit and decision >= decision_limit:
+            break
+    env.close()
+    return record
 
 
 def cmd_collect(args, config, device):
-    output = args.output
-    meta_path = output + ".meta.json"
-    C.reserve_outputs([output, meta_path])
-    planned = C.scene_range(config, "train")
+    source = args.source or config["source"]
+    splits = args.splits or ["train", "validation"]
+    for name in splits:
+        if name not in ("train", "validation"):
+            raise ValueError("collect supports the train and validation splits")
     adapter = build_adapter(config, device)
     rng = np.random.default_rng(args.seed)
     student = None
+    checkpoint_hash = None
     if args.student is not None:
         student, payload = load_student(args.student, config, device)
         student.eval()
-    checkpoint_hash = C.sha256_file(args.student) if args.student else None
+        checkpoint_hash = C.sha256_file(args.student)
     rows = []
-    start = config["train_scene_start"]
-    total = args.episodes if args.episodes is not None else config["train_episodes"]
-    if total < 1:
-        raise ValueError("--episodes must be >= 1")
-    scenes = [start + episode for episode in range(total)]
-    unknown = sorted(set(scenes) - planned)
-    if unknown:
-        raise ValueError(f"collection scenes outside the configured train range: "
-                         f"{unknown[:5]}")
-    for scene in scenes:
-        record = {"scene": scene, "contexts": []}
-        env = adapter.new_env(image=True)
-        obs, _ = adapter.reset(env, scene)
-        history = []
-        done = False
-        steps = 0
-        while not done and steps < config["episode_steps"]:
-            cond = adapter.encode_observation(obs["image"], obs["agent_pos"])
-            noise = sample_source(rng, (1, 16, 2), config["source"])
-            noise_t = torch.from_numpy(noise).to(device)
-            keep = (len(history) % 2 == 0
-                    and len(record["contexts"]) < config["contexts_per_episode"])
-            with torch.no_grad():
-                if student is None:
-                    # the teacher is the behavior policy here: no supervision is
-                    # discarded, its whole rollout IS the executed action chunk
-                    chunk = teacher_rollout(adapter.noise_pred_net, noise_t, cond,
-                                            config["teacher_steps"])
-                    student_mid = None
-                else:
-                    # behavior only needs the two student steps once; the
-                    # midpoint is reused as the stored solver state rather than
-                    # recomputed (no teacher work at unsaved decisions)
-                    chunk, midpoint = sample_with_midpoint(noise_t, cond, student)
-                    student_mid = midpoint.detach().cpu().numpy()[0]
-            chunk_n = chunk.detach().cpu().numpy()[0]
-            if not np.isfinite(chunk_n).all():
-                raise ValueError(f"nonfinite student chunk at scene {scene} step {steps}")
-            physical = adapter.decode(chunk_n[:config["execute_steps"]])
-            context = None
-            if keep:
-                if history:
-                    check_env = adapter.replay(scene, history)
-                    try:
-                        signature = [float(v) for v in adapter.signature(check_env).tolist()]
-                    finally:
-                        check_env.close()
-                else:
-                    signature = None
-                context = {"condition": cond.detach().cpu().numpy()[0], "noise": noise[0],
-                           "history": [list(map(float, row)) for row in history],
-                           "signature": signature, "scene": scene,
-                           "student_mid": None if student_mid is None else student_mid.tolist()}
-                record["contexts"].append(context)
-            for action in physical:
-                obs, _, done, _ = adapter.step(env, action)
-                history.append([float(value) for value in np.asarray(action).tolist()])
-                steps += 1
-                if done or steps >= config["episode_steps"]:
-                    break
-            if context is not None:
-                context["history_end"] = [list(map(float, row)) for row in history]
-        env.close()
-        rows.append(record)
-    scenes_seen = sorted({int(r["scene"]) for r in rows})
-    C.validate_scene_sets({"train": scenes_seen,
-                           "validation": sorted(C.scene_range(config, "validation")),
-                           "development": sorted(C.scene_range(config, "development")),
-                           "test": sorted(C.scene_range(config, "test"))})
-    payload = dict(records=np.array(rows, dtype=object),
-                   meta=json.dumps({"mode": "shared" if student is not None else "teacher",
-                                    "student": args.student, "seed": args.seed}),
-                   fingerprint=json.dumps(C.cache_fingerprint(config, config["repository"])),
-                   lineage=json.dumps(dict(source_hashes=C.source_hashes(),
-                                           checkpoint_sha256=checkpoint_hash,
-                                           episodes=int(total),
-                                           contexts_per_episode=config["contexts_per_episode"])))
-    try:
-        C.atomic_savez(output, **payload)
-    except Exception as error:
-        C.mark_incomplete(output, f"collect failed: {error}")
-        raise
-    C.write_meta(meta_path, json.loads(payload["meta"]) | dict(
-        fingerprint=json.loads(payload["fingerprint"]),
-        lineage=json.loads(payload["lineage"]), scenes=scenes_seen))
-    print("wrote cache " + output + " episodes " + str(len(rows)))
+    started = time.time()
+    for split in splits:
+        planned = sorted(C.scene_range(config, split))
+        default_count = (len(planned) if split == "train"
+                         else int(config["validation_episodes"]))
+        count = args.episodes if args.episodes is not None else default_count
+        if count < 1:
+            raise ValueError("--episodes must be >= 1")
+        scenes = planned[:count]
+        for scene in scenes:
+            rows.append(_collect_episode(adapter, config, device, scene, student,
+                                         rng, split, source, args.decision_limit))
+    seen = {split: sorted({int(r["scene"]) for r in rows if r["split"] == split})
+            for split in splits}
+    C.validate_scene_sets(seen)
+    contexts = [context for record in rows for context in record["contexts"]]
+    if not contexts:
+        raise ValueError("collection produced no contexts")
+    meta = dict(schema_version=C.SCHEMA_VERSION,
+                mode="shared" if student is not None else "teacher",
+                source=source, seed=args.seed, student=args.student,
+                splits={k: len(v) for k, v in seen.items()},
+                contexts=len(contexts), wall_s=round(time.time() - started, 1))
+    lineage = dict(source_hashes=C.source_hashes(),
+                   checkpoint_sha256=checkpoint_hash,
+                   normalizer_sha256=C.sha256_file(config["normalizer"]),
+                   mode=meta["mode"], source=source,
+                   split_scenes=seen)
+    C.write_label_cache(args.output, contexts, config, meta, lineage)
+    print(f"wrote cache {args.output} contexts {len(contexts)} "
+          f"splits {meta['splits']}")
+    return dict(contexts=len(contexts), splits=meta["splits"])
+
+
+def _metric_entry(adapter, config, device, context, eps, metric_mode):
+    cond = torch.from_numpy(np.asarray(context["condition"], dtype=np.float32)).unsqueeze(0).to(device)
+    noise = torch.from_numpy(np.asarray(context["noise"], dtype=np.float32)).unsqueeze(0).to(device)
+    steps = config["teacher_steps"]
+    with torch.no_grad():
+        y0 = torch.from_numpy(np.asarray(context["target_mid"], dtype=np.float32)).unsqueeze(0).to(device)
+        teacher_end = torch.from_numpy(np.asarray(context["teacher_end"], dtype=np.float32)).unsqueeze(0).to(device)
+        target_end = torch.from_numpy(np.asarray(context["target_end"], dtype=np.float32)).unsqueeze(0).to(device)
+    history = [np.asarray(row, dtype=np.float64) for row in context["history"]]
+    scene = int(context["scene"])
+    adapter.check_replay(scene, history, np.asarray(context["signature_live"]))
+    branches = {}
+    for tag, prefix in (("start", teacher_end.cpu().numpy()[0][:config["execute_steps"]]),
+                        ("end", target_end.cpu().numpy()[0][:config["execute_steps"]])):
+        jac = finite_difference_jacobian(
+            lambda chunk, _scene=scene, _history=history: adapter.execute_from_history(
+                _scene, _history, chunk),
+            prefix, epsilon=eps)
+        branches[tag] = jac
+    jac_start = torch.from_numpy(branches["start"].astype(np.float32)).unsqueeze(0).to(device)
+
+    def suffix(variable):
+        return teacher_half_from(variable, adapter.noise_pred_net, cond, steps)
+
+    entry = {key: context[key] for key in
+             ("scene", "split", "decision", "step", "condition", "noise",
+              "midpoint", "target_mid", "target_end", "teacher_end", "history",
+              "signature_initial", "signature_live")}
+    entry["jacobian_start"] = branches["start"].astype(np.float32)
+    entry["jacobian_end"] = branches["end"].astype(np.float32)
+    if metric_mode == "exact":
+        entry["metric_exact"] = pullback_metric_exact(
+            suffix, y0, jac_start, config["execute_steps"]).detach().cpu().numpy()[0].astype(np.float32)
+    else:
+        entry["probes"] = pullback_probes(
+            suffix, y0, jac_start, config["execute_steps"],
+            num_probes=config["num_probes"]).detach().cpu().numpy()[0].astype(np.float32)
+    return entry
 
 
 def cmd_metrics(args, config, device):
-    output = args.output
-    meta_path = output + ".meta.json"
-    C.reserve_outputs([output, meta_path])
     adapter = build_adapter(config, device)
-    cache = np.load(args.cache, allow_pickle=True)
-    info = C.verify_cache(cache, config, config["repository"], expect_mode="shared",
-                          expect_scenes=C.scene_range(config, "train"))
-    contexts = []
-    for record in cache["records"]:
-        contexts.extend(record["contexts"])
-    if args.limit is not None:
-        if args.limit < 1:
-            raise ValueError("--limit must be >= 1")
-        contexts = contexts[:args.limit]
+    verified = C.verify_label_cache(args.cache, config, expect_mode="shared")
+    train_rows, validation_rows = C.metric_subset(verified, config,
+                                                  limit=args.limit)
+    selected = train_rows + validation_rows
+    if not selected:
+        raise ValueError("metric subset is empty; collect the shared cache first")
     eps = config["finite_difference_epsilon"]
-    steps = config["teacher_steps"]
-    mode = config.get("metric_mode", "exact")
+    metric_mode = config.get("metric_mode", "exact")
+    print(f"[metrics] selected {len(train_rows)} train + {len(validation_rows)} "
+          f"validation contexts of {verified['n_contexts']} (metric_mode="
+          f"{metric_mode}); one repeated-branch determinism check per context")
     out = []
-    for index, context in enumerate(contexts):
-        cond = torch.from_numpy(np.asarray(context["condition"], dtype=np.float32)).unsqueeze(0).to(device)
-        noise = torch.from_numpy(np.asarray(context["noise"], dtype=np.float32)).unsqueeze(0).to(device)
-        student_mid = torch.from_numpy(np.asarray(context["student_mid"], dtype=np.float32)).unsqueeze(0).to(device)
-        with torch.no_grad():
-            teacher_mid, _ = teacher_half_maps(adapter.noise_pred_net, noise, cond, steps)
-            y0 = teacher_mid.detach()
-            endpoint = teacher_half_from(y0, adapter.noise_pred_net, cond, steps).detach()
-            second = teacher_half_from(student_mid, adapter.noise_pred_net, cond, steps).detach()
-        history = [np.asarray(row, dtype=np.float64) for row in context["history"]]
-        scene = int(context["scene"])
-        if context["signature"] is not None:
-            adapter.check_replay(scene, history, np.asarray(context["signature"]))
-        prefix_a = endpoint.detach().cpu().numpy()[0][:config["execute_steps"]]
-        prefix_b = second.detach().cpu().numpy()[0][:config["execute_steps"]]
-        branches = {}
-        for tag, prefix in (("start", prefix_a), ("end", prefix_b)):
-            jac = finite_difference_jacobian(
-                lambda chunk, _scene=scene, _history=history: adapter.execute_from_history(_scene, _history, chunk),
-                prefix, epsilon=eps)
-            dup = finite_difference_jacobian(
-                lambda chunk, _scene=scene, _history=history: adapter.execute_from_history(_scene, _history, chunk),
-                prefix, epsilon=eps)
-            repeat_gap = float(np.abs(jac - dup).max())
-            if not np.isfinite(repeat_gap) or repeat_gap > 1e-6:
-                raise ValueError(f"repeated branch disagreement at scene {scene} "
-                                 f"({tag}): {repeat_gap}")
-            branches[tag] = jac
-        jac_start = torch.from_numpy(branches["start"].astype(np.float32)).unsqueeze(0).to(device)
-
-        def suffix(variable):
-            return teacher_half_from(variable, adapter.noise_pred_net, cond, steps)
-
-        entry = {"condition": context["condition"], "noise": context["noise"],
-                 "midpoint": student_mid.detach().cpu().numpy()[0],
-                 "target_mid": y0.detach().cpu().numpy()[0],
-                 "target_end": second.detach().cpu().numpy()[0],
-                 "teacher_end": endpoint.detach().cpu().numpy()[0],
-                 "jacobian_start": branches["start"].astype(np.float32),
-                 "jacobian_end": branches["end"].astype(np.float32),
-                 "scene": scene, "history": context["history"]}
-        if mode == "exact":
-            metric = pullback_metric_exact(suffix, y0, jac_start,
-                                           config["execute_steps"])
-            entry["metric_exact"] = metric.detach().cpu().numpy()[0].astype(np.float32)
-        else:
-            entry["probes"] = pullback_probes(
-                suffix, y0, jac_start, config["execute_steps"],
-                num_probes=config["num_probes"]).detach().cpu().numpy()[0].astype(np.float32)
+    timings = []
+    for index, context in enumerate(selected):
+        start = time.perf_counter()
+        entry = _metric_entry(adapter, config, device, context, eps, metric_mode)
+        elapsed = time.perf_counter() - start
+        timings.append(elapsed)
         out.append(entry)
-    payload = dict(contexts=np.array(out, dtype=object),
-                   meta=json.dumps({"epsilon": eps, "count": len(out),
-                                    "metric_mode": mode,
-                                    "num_probes": config["num_probes"]}),
-                   fingerprint=json.dumps(C.cache_fingerprint(
-                       config, config["repository"], extra=C.metric_extra_keys(config))),
-                   lineage=json.dumps(dict(source_hashes=C.source_hashes(),
-                                           cache=C.sha256_file(args.cache),
-                                           cache_meta=info["meta"])))
-    try:
-        C.atomic_savez(output, **payload)
-    except Exception as error:
-        C.mark_incomplete(output, f"metrics failed: {error}")
-        raise
-    C.write_meta(meta_path, json.loads(payload["meta"]) | dict(
-        fingerprint=json.loads(payload["fingerprint"]),
-        lineage=json.loads(payload["lineage"])))
-    print("wrote metrics " + output + " contexts " + str(len(out)))
+        if index == 0:
+            print(f"[metrics] first context took {elapsed:.2f}s; projected "
+                  f"{elapsed * len(selected) / 60:.1f} min for {len(selected)} "
+                  f"contexts", flush=True)
+        elif (index + 1) % 25 == 0:
+            done = sum(timings)
+            projected = done / (index + 1) * len(selected)
+            print(f"[metrics] {index + 1}/{len(selected)} elapsed {done / 60:.1f} "
+                  f"min projected {projected / 60:.1f} min", flush=True)
+    # one repeated-branch determinism check instead of duplicating every Jacobian
+    probe_context = selected[0]
+    prefix = np.asarray(probe_context["teacher_end"], dtype=np.float64)[:config["execute_steps"]]
+    history = [np.asarray(row, dtype=np.float64) for row in probe_context["history"]]
+    scene = int(probe_context["scene"])
+    repeat_a = finite_difference_jacobian(
+        lambda chunk: adapter.execute_from_history(scene, history, chunk), prefix,
+        epsilon=eps)
+    repeat_b = finite_difference_jacobian(
+        lambda chunk: adapter.execute_from_history(scene, history, chunk), prefix,
+        epsilon=eps)
+    repeat_gap = float(np.abs(repeat_a - repeat_b).max())
+    if not np.isfinite(repeat_gap) or repeat_gap > 1e-6:
+        raise ValueError(f"repeated branch disagreement at scene {scene}: "
+                         f"{repeat_gap}")
+    meta = dict(schema_version=C.SCHEMA_VERSION, metric_mode=metric_mode,
+                num_probes=config["num_probes"], epsilon=eps,
+                counts=dict(train=len(train_rows), validation=len(validation_rows),
+                            total=len(out)),
+                repeat_branch_gap=repeat_gap,
+                per_context_seconds=timings,
+                mean_context_seconds=float(np.mean(timings)),
+                source=verified["meta"].get("source"),
+                splits={row["split"] for row in out})
+    meta["splits"] = {split: sum(1 for row in out if row["split"] == split)
+                      for split in sorted({row["split"] for row in out})}
+    lineage = dict(source_hashes=C.source_hashes(),
+                   cache=C.sha256_file(args.cache),
+                   cache_meta=verified["meta"],
+                   epsilon=eps, metric_mode=metric_mode)
+    C.write_metric_cache(args.output, out, config, meta, lineage)
+    print(f"wrote metrics {args.output} contexts {len(out)}")
+    return dict(contexts=len(out), meta=meta)
 
 
-def batch_from_contexts(contexts, indices, device, metric_mode):
+def batch_from_contexts(contexts, indices, device, metric_mode, need_metric):
     pick = [contexts[i] for i in indices]
     keys = ["condition", "noise", "midpoint", "target_mid", "target_end",
-            "teacher_end", "jacobian_start", "jacobian_end"]
-    keys.append("metric_exact" if metric_mode == "exact" else "probes")
+            "teacher_end"]
+    if need_metric:
+        keys += ["jacobian_start", "jacobian_end"]
+        keys.append("metric_exact" if metric_mode == "exact" else "probes")
     batch = {}
     for key in keys:
         values = np.stack([np.asarray(entry[key]) for entry in pick])
@@ -292,49 +334,67 @@ def batch_from_contexts(contexts, indices, device, metric_mode):
 
 
 def cmd_train(args, config, device):
-    output = args.output
-    meta_path = output + ".meta.json"
-    C.reserve_outputs([output, meta_path])
-    protocol, protocol_id = resolve_protocol_id(args, config, device)
-    data = np.load(args.cache, allow_pickle=True)
-    info = C.verify_metric_cache(data, config, config["repository"],
-                                 expect_scenes=C.scene_range(config, "train"))
-    contexts = list(data["contexts"])
-    n = len(contexts)
-    rows = np.arange(n)
+    protocol, protocol_id = protocol_for(args, config)
+    needs_metric = mode_needs_metric(args.mode)
+    verified = C.verify_label_cache(args.cache, config, expect_mode="shared",
+                                    require_metric=needs_metric)
+    train_contexts = C.select_split(verified, "train")
+    if not train_contexts:
+        raise ValueError("cache holds no training-split contexts")
+    if not needs_metric:
+        print(f"[train] mode {args.mode}: label-only path, no Jacobians, no "
+              "transported metric, no scale estimation")
     metric_mode = config.get("metric_mode", "exact")
-    metric_key = "metric_exact" if metric_mode == "exact" else "probes"
-    cache_tensors = {"jacobian_start": torch.from_numpy(np.stack([c["jacobian_start"] for c in contexts])).float(),
-                     "jacobian_end": torch.from_numpy(np.stack([c["jacobian_end"] for c in contexts])).float(),
-                     metric_key: torch.from_numpy(np.stack([c[metric_key] for c in contexts])).float()}
-    scales, scale_stats = metric_scales(cache_tensors, rows, metric_mode=metric_mode)
-    student = TwoStepStudent(condition_dim=514, horizon=16, action_dim=2,
-                             width=config["width"]).to(device)
-    if args.initial:
-        student, initial_payload = load_student(args.initial, config, device)
+    scales, scale_stats = None, None
+    if needs_metric:
+        metric_key = "metric_exact" if metric_mode == "exact" else "probes"
+        jac_start = np.stack([c["jacobian_start"] for c in train_contexts])
+        jac_end = np.stack([c["jacobian_end"] for c in train_contexts])
+        metric = np.stack([c[metric_key] for c in train_contexts])
+        for name, value in (("jacobian_start", jac_start), ("jacobian_end", jac_end),
+                            (metric_key, metric)):
+            if not np.isfinite(value).all():
+                raise ValueError("nonfinite cached tensor " + name)
+        scales, scale_stats = metric_scales(
+            torch.from_numpy(jac_start).float(), torch.from_numpy(jac_end).float(),
+            torch.from_numpy(metric).float(), metric_mode=metric_mode)
+        print("[train] scales " + json.dumps(scales) + " stats " +
+              json.dumps(scale_stats))
+    seed_state = torch.load(args.initial, map_location=device,
+                            weights_only=True) if args.initial else None
+    if seed_state is not None:
+        C.verify_student_provenance(seed_state, protocol, config, args.initial)
+    student = make_student(config, device, seed=args.seed,
+                           state_dict=seed_state["student"] if seed_state else None)
     optimizer = torch.optim.AdamW(student.parameters(), lr=config["learning_rate"],
                                   weight_decay=config["weight_decay"])
     rng = np.random.default_rng(args.seed)
-    metric_rows = set(rng.choice(n, size=min(n, config["metric_contexts"]),
-                                 replace=False).tolist())
+    n = len(train_contexts)
+    metric_rows = set()
+    if needs_metric:
+        metric_rows = set(rng.choice(n, size=min(n, config["metric_contexts"]),
+                                     replace=False).tolist())
     student.train()
     log = []
     grad_norms = []
     for update in range(args.updates):
         first = rng.integers(0, n, size=config["batch_size"] // 2).tolist()
-        marked = rng.choice(sorted(metric_rows), size=config["batch_size"] // 2,
-                            replace=True).tolist()
+        if metric_rows:
+            marked = rng.choice(sorted(metric_rows), size=config["batch_size"] // 2,
+                                replace=True).tolist()
+        else:
+            marked = rng.integers(0, n, size=config["batch_size"] // 2).tolist()
         indices = first + marked
         rng.shuffle(indices)
-        batch = batch_from_contexts(contexts, indices, device, metric_mode)
+        batch = batch_from_contexts(train_contexts, indices, device, metric_mode,
+                                    needs_metric)
         is_marked = torch.tensor([i in metric_rows for i in indices], device=device)
         order = torch.argsort(~is_marked)
         for key in batch:
             batch[key] = batch[key][order]
         metric_count = int(is_marked.sum().item())
         loss, parts = objective(student, batch, args.mode, config["execute_steps"],
-                                {key: torch.tensor(value, device=device) for key, value in scales.items()},
-                                metric_weight=config["metric_weight"],
+                                scales, metric_weight=config["metric_weight"],
                                 anchor_weight=config["anchor_weight"],
                                 metric_count=metric_count, metric_mode=metric_mode)
         if not torch.isfinite(loss):
@@ -359,30 +419,29 @@ def cmd_train(args, config, device):
         if not torch.isfinite(tensor).all():
             raise ValueError("nonfinite parameter after training; refusing to save")
     payload = dict(student=student.state_dict(), mode=args.mode, seed=args.seed,
-                   scales=scales, scale_stats=scale_stats,
-                   metric_mode=metric_mode, scales_note="global training median",
+                   updates=args.updates,
+                   scales=scales, scale_stats=scale_stats, metric_mode=metric_mode,
                    protocol_id=protocol_id,
                    config_sha256=C.sha256_file(args.config),
-                   init_sha256=C.sha256_file(args.initial) if args.initial else None,
+                   init_sha256=(C.sha256_file(args.initial) if args.initial else None),
                    cache_sha256=C.sha256_file(args.cache),
+                   needs_metric=bool(needs_metric),
                    log=log, grad_norm_mean=float(np.mean(grad_norms)),
                    grad_norm_max=float(np.max(grad_norms)))
-    C.atomic_save_torch(output, payload)
-    C.write_meta(meta_path, dict(kind="student", mode=args.mode, seed=args.seed,
-                                 metric_mode=metric_mode, protocol_id=protocol_id,
-                                 scales=scales, scale_stats=scale_stats,
-                                 grad_norm_mean=float(np.mean(grad_norms)),
-                                 updates=args.updates,
-                                 source_hashes=C.source_hashes()))
-    print("wrote student " + output + " mode " + args.mode +
-          " zero_sensitivity=" + str(scale_stats["zero_sensitivity_fraction"]))
+    C.atomic_save_torch(args.output, payload)
+    C.write_meta(args.output + ".meta.json",
+                 dict(kind="student", mode=args.mode, seed=args.seed,
+                      updates=args.updates, metric_mode=metric_mode,
+                      protocol_id=protocol_id, scales=scales,
+                      scale_stats=scale_stats, needs_metric=bool(needs_metric),
+                      grad_norm_mean=float(np.mean(grad_norms)),
+                      source_hashes=C.source_hashes()))
+    print("wrote student " + args.output + " mode " + args.mode)
+    return dict(mode=args.mode, seed=args.seed, updates=args.updates)
 
 
 def cmd_evaluate(args, config, device):
-    output = args.output
-    meta_path = output.replace(".jsonl", ".meta.json")
-    C.reserve_outputs([output, meta_path])
-    protocol, protocol_id = resolve_protocol_id(args, config, device)
+    protocol, protocol_id = protocol_for(args, config)
     adapter = build_adapter(config, device)
     student = None
     intrinsic_mode = args.name
@@ -391,17 +450,19 @@ def cmd_evaluate(args, config, device):
     if args.student:
         student, payload = load_student(args.student, config, device)
         student.eval()
+        C.verify_student_provenance(payload, protocol, config, args.student)
         intrinsic_mode = str(payload["mode"])
         intrinsic_seed = int(payload["seed"])
         checkpoint_hash = C.sha256_file(args.student)
     source = args.source or config["source"]
     steps = args.steps
+    split = "development" if args.development else "test"
     rng = np.random.default_rng(args.seed)
     episodes = args.episodes if args.episodes is not None else (
-        config["development_episodes"] if args.development else config["test_episodes"])
+        config["development_episodes"] if args.development
+        else config["test_episodes"])
     if episodes < 1:
         raise ValueError("--episodes must be >= 1")
-    split = "development" if args.development else "test"
     start = config["development_scene_start"] if args.development else config["test_scene_start"]
     scenes = [start + episode for episode in range(episodes)]
     unknown = sorted(set(scenes) - C.scene_range(config, split))
@@ -409,52 +470,55 @@ def cmd_evaluate(args, config, device):
         raise ValueError(f"evaluation scenes outside the {split} range: {unknown[:5]}")
     C.validate_scene_sets({split: scenes, "train": sorted(C.scene_range(config, "train"))})
     max_decisions = config["episode_steps"] // config["execute_steps"] + 2
-    print(f"[eval] device={device} source={source} steps={steps} "
-          f"split={split} episodes={len(scenes)} intrinsic_mode={intrinsic_mode}")
-    with open(output, "w") as handle:
-        for scene in scenes:
-            policy_noise = rng.standard_normal((max_decisions, 16, 2)).astype(np.float32)
+    warmup = max(0, int(config.get("warmup_episodes", 0)))
+    sync = (lambda: torch.cuda.synchronize()) if device.type == "cuda" else (lambda: None)
+    print(f"[eval] device={device} source={source} steps={steps} split={split} "
+          f"episodes={len(scenes)} intrinsic_mode={intrinsic_mode} "
+          f"warmup_episodes={warmup} clip={config['clip_actions']}")
+    with open(args.output, "w") as handle:
+        for episode, scene in enumerate(scenes):
+            policy_noise = np.stack([sample_source(rng, (16, 2), source)
+                                     for _ in range(max_decisions)])
             env = adapter.new_env(image=True)
             obs, _ = adapter.reset(env, scene)
             done = False
             steps_taken = 0
             best = 0.0
-            latencies = []
+            decision_latencies = []
             head_latencies = []
-            oor = 0
-            total_cmds = 0
-            clipped = 0
+            raw_violations = 0
+            executed_violations = 0
+            coordinates = 0
+            clipped_coordinates = 0
             terminated_any = False
             truncated_any = False
             decision = 0
             while not done and steps_taken < config["episode_steps"]:
+                decision_start = time.perf_counter()
                 cond = adapter.encode_observation(obs["image"], obs["agent_pos"])
-                slot = min(decision, max_decisions - 1)
-                noise = policy_noise[slot][None, ...]
+                sync()
+                head_start = time.perf_counter()
+                noise = policy_noise[min(decision, max_decisions - 1)][None, ...]
                 noise_t = torch.from_numpy(noise).to(device)
-                tick = time.time()
-                head_tick = time.time()
                 with torch.no_grad():
                     if student is not None:
-                        chunk = student.sample(noise_t, cond).cpu().numpy()[0]
+                        chunk = student.sample(noise_t, cond)
                     else:
                         chunk = teacher_rollout(adapter.noise_pred_net, noise_t,
-                                                cond, steps).cpu().numpy()[0]
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
-                head_latencies.append((time.time() - head_tick) * 1000.0)
-                latencies.append((time.time() - tick) * 1000.0)
+                                                cond, steps)
+                sync()
+                head_latencies.append((time.perf_counter() - head_start) * 1000.0)
+                prepared = adapter.prepare_commands(
+                    chunk.detach().cpu().numpy()[0][:config["execute_steps"]])
+                sync()
+                decision_latencies.append((time.perf_counter() - decision_start) * 1000.0)
                 decision += 1
-                prefix = chunk[:config["execute_steps"]]
-                raw = adapter.decode_raw(prefix)
-                raw_oor, raw_total = adapter.count_out_of_range(raw)
-                physical = adapter.decode(prefix)
-                if adapter.clip_actions:
-                    clipped += int(np.count_nonzero(
-                        (physical < 0) | (physical > 512)))
-                for action in physical:
-                    total_cmds += 1
-                    oor += int(np.count_nonzero((action < 0) | (action > 512)))
+                raw_violations += prepared["raw_violations"]
+                executed_violations += prepared["executed_violations"]
+                coordinates += prepared["coordinates"]
+                clipped_coordinates += (prepared["raw_violations"]
+                                        if prepared["clipped"] else 0)
+                for action in prepared["prepared"]:
                     obs, reward, terminated, truncated, done = adapter.raw_step(env, action)
                     best = max(best, reward)
                     terminated_any = terminated_any or terminated
@@ -464,34 +528,40 @@ def cmd_evaluate(args, config, device):
                         break
             env.close()
             capped = bool(steps_taken >= config["episode_steps"] and not terminated_any)
-            success = int(best >= 0.95 and terminated_any)
+            success = int(terminated_any and best >= 0.95)
+            is_warmup = episode < warmup
             handle.write(json.dumps({
                 "method": intrinsic_mode, "alias": args.name,
                 "intrinsic_mode": intrinsic_mode, "intrinsic_seed": intrinsic_seed,
                 "training_seed": intrinsic_seed, "scene": scene, "split": split,
+                "warmup": int(is_warmup),
                 "success": success, "terminated": int(terminated_any),
                 "truncated": int(truncated_any), "episode_cap_reached": int(capped),
                 "score": best, "steps": steps_taken,
                 "source": source, "teacher_steps": steps,
-                "latency_median_ms": float(np.median(latencies)),
-                "latency_p95_ms": float(np.quantile(latencies, 0.95)),
-                "action_head_latency_median_ms": float(np.median(head_latencies)),
-                "oor_fraction_raw": raw_oor / max(raw_total, 1),
-                "oor_fraction_executed": oor / max(total_cmds, 1),
-                "clip_fraction": clipped / max(raw_total, 1),
+                "decision_latency_median_ms": (None if is_warmup else
+                                               float(np.median(decision_latencies))),
+                "decision_latency_p95_ms": (None if is_warmup else
+                                            float(np.quantile(decision_latencies, 0.95))),
+                "action_head_latency_median_ms": (None if is_warmup else
+                                                  float(np.median(head_latencies))),
+                "raw_violation_fraction": raw_violations / max(coordinates, 1),
+                "executed_violation_fraction": executed_violations / max(coordinates, 1),
+                "clip_fraction": clipped_coordinates / max(coordinates, 1),
+                "coordinates": coordinates,
                 "protocol_id": protocol_id,
                 "checkpoint_sha256": checkpoint_hash}) + "\n")
-    C.write_meta(meta_path, dict(kind="evaluation", alias=args.name,
-                                 intrinsic_mode=intrinsic_mode,
-                                 intrinsic_seed=intrinsic_seed,
-                                 checkpoint_sha256=checkpoint_hash,
-                                 protocol_id=protocol_id, split=split,
-                                 scenes=scenes, source=source,
-                                 teacher_steps=steps, device=str(device),
-                                 clip_actions=bool(config["clip_actions"]),
-                                 methods=[intrinsic_mode],
-                                 source_hashes=C.source_hashes()))
-    print("wrote eval " + output)
+    C.write_meta(args.output.replace(".jsonl", ".meta.json"),
+                 dict(kind="evaluation", alias=args.name,
+                      intrinsic_mode=intrinsic_mode, intrinsic_seed=intrinsic_seed,
+                      checkpoint_sha256=checkpoint_hash, protocol_id=protocol_id,
+                      split=split, expected_split=split, scenes=scenes,
+                      source=source, teacher_steps=steps, device=str(device),
+                      clip_actions=bool(config["clip_actions"]),
+                      warmup_episodes=warmup,
+                      source_hashes=C.source_hashes()))
+    print("wrote eval " + args.output)
+    return dict(rows=len(scenes), mode=intrinsic_mode, seed=intrinsic_seed)
 
 
 def main():
@@ -499,6 +569,8 @@ def main():
     parser.add_argument("--config", default="experiment/config.json")
     parser.add_argument("--device", default=None)
     parser.add_argument("--protocol", default=None)
+    parser.add_argument("--allow-unlocked", action="store_true",
+                        help="permitted only for development stages")
     sub = parser.add_subparsers(dest="command", required=True)
     entry = sub.add_parser("normalizer")
     entry.add_argument("--dataset", required=True)
@@ -508,6 +580,9 @@ def main():
     entry.add_argument("--student", default=None)
     entry.add_argument("--seed", type=int, default=0)
     entry.add_argument("--episodes", type=int, default=None)
+    entry.add_argument("--splits", nargs="*", default=None)
+    entry.add_argument("--source", default=None)
+    entry.add_argument("--decision-limit", type=int, default=None)
     entry = sub.add_parser("metrics")
     entry.add_argument("--cache", required=True)
     entry.add_argument("--output", required=True)
@@ -516,7 +591,8 @@ def main():
     entry.add_argument("--cache", required=True)
     entry.add_argument("--output", required=True)
     entry.add_argument("--mode", required=True,
-                       choices=["uniform", "prefix", "endpoint", "pullback", "identity", "scalar"])
+                       choices=["uniform", "prefix", "endpoint", "pullback",
+                                "identity", "scalar"])
     entry.add_argument("--seed", type=int, default=0)
     entry.add_argument("--updates", type=int, default=None)
     entry.add_argument("--initial", default=None)
@@ -525,7 +601,8 @@ def main():
     entry.add_argument("--name", required=True)
     entry.add_argument("--student", default=None)
     entry.add_argument("--steps", type=int, default=None)
-    entry.add_argument("--source", default=None, choices=["gaussian", "uniform"])
+    entry.add_argument("--source", default=None,
+                       choices=["gaussian", "uniform", "uniform_symmetric"])
     entry.add_argument("--seed", type=int, default=0)
     entry.add_argument("--episodes", type=int, default=None)
     entry.add_argument("--development", action="store_true")
@@ -541,17 +618,32 @@ def main():
         args.steps = config["teacher_steps"]
     if args.command == "evaluate" and args.steps < 1:
         raise ValueError("--steps must be >= 1")
-    if args.command == "normalizer":
-        cmd_normalizer(args, config, device)
-    elif args.command == "collect":
-        cmd_collect(args, config, device)
-    elif args.command == "metrics":
-        cmd_metrics(args, config, device)
-    elif args.command == "train":
-        cmd_train(args, config, device)
-    elif args.command == "evaluate":
-        cmd_evaluate(args, config, device)
+    output = getattr(args, "output", None)
+    meta_path = None
+    if output:
+        meta_path = (args.output.replace(".jsonl", ".meta.json")
+                     if args.command == "evaluate" else output + ".meta.json")
+        C.reserve_outputs([output, meta_path])
+    try:
+        if args.command == "normalizer":
+            cmd_normalizer(args, config, device)
+        elif args.command == "collect":
+            cmd_collect(args, config, device)
+        elif args.command == "metrics":
+            cmd_metrics(args, config, device)
+        elif args.command == "train":
+            cmd_train(args, config, device)
+        elif args.command == "evaluate":
+            cmd_evaluate(args, config, device)
+    except Exception as error:
+        if output:
+            C.mark_incomplete(output, f"{type(error).__name__}: {error}")
+        raise
+    else:
+        if output:
+            C.complete_output(output)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

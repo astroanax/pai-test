@@ -1,106 +1,109 @@
 execution pullback pilot, project-i workspace
 
-layout, all under execution-pullback/experiment/
-- contract.py      config validation, split checks, source/upstream/package hashing,
-                   cache-contract fingerprint, protocol id, atomic writes, output
-                   reservation, completeness/metadata requirements, file manifest
-- core.py          student, integration, finite differences, VJP probes, exact
-                   transmitted metric, six losses, scale matching
-- hri_adapter.py   strict checkpoint load, complete-history replay, flag separation
-- pilot.py         normalizer, collect, metrics, train, evaluate
+Files, all under execution-pullback/experiment/
+- contract.py      config validation, split checks, hashing, cache schema v2
+                   writers/verifiers, protocol id and revalidation, atomic writes,
+                   reservation plus completion records, file manifest
+- core.py          student, integration, one shared source sampler, finite
+                   differences, VJP probes, exact transmitted metric, six losses,
+                   scale matching
+- hri_adapter.py   device-aware strict checkpoint load, complete-history replay,
+                   flag separation, single command-preparation pathway
+- pilot.py         normalizer, collect (train plus validation, with labels),
+                   metrics (pre-selected budget), train (label-only or metric),
+                   evaluate
 - diagnose.py      held-out geometry diagnostic on actual student errors
-- analyze.py       protocol-bound paired analysis
-- smoke.py         target-stack smoke report (required before locking)
-- sanity.py        algebra, contract, and estimator regression tests
-- preflight.py     imports, cuda, assets, manifest, config, exit status
-- lock_protocol.py protocol lock with source, upstream, and package provenance
-- run_comparison.sh locked matched comparison including reference and native-fast
-- MANIFEST.json    file manifest for transfer verification
+- analyze.py       protocol-bound paired analysis over the full locked run set
+- smoke.py         target-stack smoke report, required before locking
+- sanity.py        algebra, schema, protocol, and estimator regressions
+- preflight.py     imports, cuda requirement, assets, manifest, exit status
+- lock_protocol.py protocol lock with source, upstream, package, and choice
+                   provenance
+- run_comparison.sh stage-2 runner: verifies locked artifacts, reads every
+                   setting from the lock, never creates the lock
+- MANIFEST.json    transfer manifest
 
-conventions fixed from upstream
-- training source is gaussian noise; the upstream test example uses uniform noise
-  with one euler step, so native-fast is evaluated explicitly (native_fast_* keys)
-- pred horizon 16, action dim 2, execution horizon 8, condition dim 514,
-  agent action range 0 to 512, success is block coverage above 0.95 within 300 steps
-- do not add ImageNet normalization: the HRI image environment already normalizes
-- teacher_steps must be even so the half map is well defined
+Run order (schema v2 artifacts are incompatible with v1; rebuild them)
+1  python experiment/preflight.py --config experiment/config.json \
+       --write-manifest experiment/MANIFEST.json
+2  python experiment/pilot.py --config experiment/config.json \
+       normalizer --dataset <zarr path> --output assets/normalizer.npz
+3  python experiment/sanity.py --require-torch
+4  python experiment/smoke.py --config experiment/config.json \
+       --output runs/smoke_report.json
+5  teacher cache:     pilot.py collect --output runs/teacher_cache.npz
+   warm student:      pilot.py train --cache runs/teacher_cache.npz \
+                          --mode uniform --output runs/warm.pt --allow-unlocked
+6  shared cache:      pilot.py collect --student runs/warm.pt \
+                          --output runs/shared_cache.npz
+7  metric profile:    pilot.py metrics --cache runs/shared_cache.npz --limit 8 \
+                          --output runs/profile_metrics.npz
+   metric cache:      pilot.py metrics --cache runs/shared_cache.npz \
+                          --output runs/shared_metrics.npz
+8  geometry:          diagnose.py --cache runs/shared_metrics.npz \
+                          --student runs/warm.pt --output runs/geometry.json \
+                          --predictions runs/geometry_predictions.npz
+9  lock:              lock_protocol.py --confirm-no-final-results
+10 bash experiment/run_comparison.sh
 
-method notes
-- execution_pullback exact metric: C = B0 J_prefix, Q0(e) = ||C e||^2,
-  tr M = ||C||_F^2, built with one VJP per prefix output (16 backwards passes, no
-  extra simulator branches). This replaces the rank-4 probe sketch, which leaves
-  consequential directions unpenalized; metric_mode="sketch" keeps the probe path
-  with an audit against the exact metric and a probe-count sweep in diagnose.py
-- switch modes never mix the two metric representations; the cache records which
-  one it holds and contract.py rejects a mismatch
+Notes on conventions
+- source distributions are not interchangeable: `gaussian` is randn, `uniform`
+  is the upstream native-fast [0, 1) draw, `uniform_symmetric` is [-1, 1). The
+  same sampler serves collection and evaluation.
+- do not add ImageNet normalization; the HRI image environment already
+  normalizes the rendered frames.
+- teacher_steps must be even so the half map is well defined.
+- `uniform` and `prefix` train on labels only; `endpoint`, `pullback`,
+  `identity`, and `scalar` require the metric cache. The warm start never needs
+  simulator derivatives.
 
-run order
-- python experiment/preflight.py --write-manifest experiment/MANIFEST.json
-- python experiment/sanity.py --require-torch
-- python experiment/smoke.py            (must pass before locking)
-- python experiment/pilot.py normalizer --dataset <zarr> --output assets/normalizer.npz
-- python experiment/pilot.py collect --output runs/teacher_cache.npz
-- python experiment/pilot.py train --cache runs/teacher_cache.npz --mode uniform --output runs/warm.pt
-- python experiment/pilot.py collect --student runs/warm.pt --output runs/shared_cache.npz
-- python experiment/pilot.py metrics --cache runs/shared_cache.npz --limit 8 --output runs/profile_metrics.npz
-- python experiment/pilot.py metrics --cache runs/shared_cache.npz --output runs/shared_metrics.npz
-- python experiment/diagnose.py --cache runs/shared_metrics.npz --student runs/warm.pt \
-    --output runs/geometry_diagnostic.json --predictions runs/geometry_predictions.npz
-- python experiment/pilot.py train --cache runs/shared_metrics.npz --mode pullback \
-    --updates 250 --initial runs/warm.pt --output runs/profile_student.pt
-- python experiment/lock_protocol.py --confirm-no-final-results
-- bash experiment/run_comparison.sh
+Fixes applied against the third audit
+1  teacher modules are moved to the selected device and the batch-independence
+   test builds its tensors on the model device; smoke asserts placements
+2  warm start restored: collection stores the teacher targets, `uniform` and
+   `prefix` train from labels alone, and metric scales are computed only for
+   metric modes
+3  one versioned schema: collection and metrics both write a flattened top-level
+   `contexts` array through contract.py, and every consumer validates that
+   normalized form
+4  collection covers train and validation with split labels; training filters the
+   train split; the diagnostic uses validation scenes only
+5  the sanity suffix returns its input shape and the transported metric is
+   compared against an independently known linear composition
+6  smoke no longer calls numpy on a cuda tensor and derives the exact-metric
+   shape (batch, physical dim, horizon x action dim) = (1, 32, 32)
+7  the diagnostic uses 16x2 generative errors, 32-dimensional directions,
+   singular vectors wrapped as single-element lists, and converts to the
+   8-action prefix only at the execution boundary
+8  the runner verifies existing artifacts, refuses to create the lock, and reads
+   modes, seeds, updates, cache, warm start, reference, and native-fast settings
+   from the lock
+9  evaluation metadata is indexed by (intrinsic mode, intrinsic seed), verified
+   against each file's own rows, scene set, and split
+10 evaluation honours the requested source, and one shared sampler implements
+   the declared conventions
+11 the diagnostic now perturbs the teacher midpoint and runs the suffix for the
+   early term, and tests late and endpoint terms on their own inputs with squared
+   feature differences, plus an epsilon versus epsilon/2 stability check
+12 live signatures are recorded from the image environment before each chunk and
+   the initial signature is stored; smoke compares image and state transitions
+13 one prepare_commands pathway decodes, records raw violations, clips once, and
+   returns exactly what is executed; counters are per coordinate
+14 training, evaluation, and analysis call verify_current_protocol, which
+   recomputes sources, upstream, packages, configuration, and asset hashes; the
+   canonical id includes warm start, modes, seeds, updates, and the smoke report
+15 the metric subset is chosen before any derivative work, validation contexts
+   are included, one repeated-branch check replaces duplicate Jacobians, labels
+   are kept for the full cache, and per-context timing is logged
+16 decision timing spans encoding through host-side command preparation, the
+   action head is timed separately, cuda is synchronized at explicit boundaries,
+   perf_counter is used, and warm-up episodes are flagged and excluded
+plus tie-aware Spearman with an explicit constant-input note, preflight honouring
+   --config and failing on an unavailable cuda request, real output reservation
+   with completion records, descriptive tables that require every locked run,
+   binary success validation, torch seeding tied to the training seed, and a
+   transfer manifest
 
-audit fixes, all against the second friend audit
-1  analysis loads the protocol lock, requires the full method x seed x scene product
-   for both arms, rejects missing runs even when the remainder pairs, requires the
-   declared primary contrast, and refuses a degenerate bootstrap frame
-2  the lock hashes the experiment sources, the upstream model files and commit, and
-   package versions; the protocol id is written into every checkpoint, evaluation
-   row, and sidecar, and rechecked before evaluation and analysis
-3  cache contract fingerprint covers source distribution, solver, execution horizon,
-   action decoding, physical features, upstream implementation, and collection
-   episode cap; diagnose.py verifies the cache and records its lineage
-4  configured scene ranges must be pairwise disjoint; caches, evaluations, and the
-   lock are checked against the declared splits
-5  the prefix extra loss uses the marked metric half, matching the physical penalties
-6  exact transmitted metric replaces the four-probe sketch by default
-7  the diagnostic accepts a student checkpoint, measures actual mid/end/endpoint
-   errors, tests consequences along those errors, includes the identity comparator,
-   covers the late and endpoint terms, samples validation contexts across scenes,
-   and saves every prediction
-8  the reference teacher is read from the locked config, and native-fast is a
-   separate configured evaluation with its own source distribution
-9  smoke.py instantiates the adapter, loads the checkpoint strictly, resets both
-   environments, checks ranges and finiteness, compares half maps, checks a suffix
-   directional derivative against finite differences, checks replay agreement,
-   runs one training step per mode, and writes a hash-bound pass/fail report
-10 gradients use error_if_nonfinite=True; the gradient norm is logged and parameters
-   are checked before saving
-11 student collection reuses one forward for the midpoint instead of recomputing it,
-   and computes no teacher supervision at unsaved decisions
-12 outputs are reserved at command startup, written atomically, and marked
-   .incomplete on failure
-13 configuration validation rejects non-positive counts, odd or single-step
-   teachers, out-of-range execution horizons, bad epsilon, and bad optimizer
-   settings; CLI defaults use is None; development defaults use development_episodes;
-   warmup_updates was removed rather than left unused
-14 success, termination, truncation, and episode-cap exhaustion are recorded
-   separately and success requires the environment's own success signal
-15 checkpoints, evaluation rows, and sidecars carry the intrinsic mode and seed;
-   analysis verifies checkpoint and protocol metadata, not just the label string
-16 training logs base, anchor, penalty, weighted penalty, gradient norm, mid/end/
-   endpoint error magnitudes, and the zero-sensitivity fraction
-17 normalizers, cached tensors, actions, signatures, and replay comparisons are
-   finiteness-checked before any tolerance test
-18 the device is resolved once, cuda synchronization is guarded, and a cuda request
-   on a cpu-only host fails loudly
-19 out-of-range commands are counted on raw decoded actions, with executed and
-   clipped counts reported separately
-20 preflight writes and verifies a file manifest, and reports which sources are not
-   tracked or are ignored by version control
-
-not run in this workspace
-- no gpu, no torch, no simulator, and no upstream checkout are present, so nothing
-  here is executed end to end; run preflight, sanity --require-torch, and smoke.py
-  on the GPU machine before locking the protocol
+Not run here: no GPU, no torch, no simulator, and no upstream checkout are
+present in this workspace, so nothing is executed end to end. Run steps 1 to 10
+on the GPU machine before locking the protocol.

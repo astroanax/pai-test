@@ -12,8 +12,15 @@ SUCCESS_COVERAGE = 0.95
 
 
 def load_checkpoint(path, device):
+    """Strict load with the modules moved onto `device`.
+
+    map_location only decides where the tensors are materialised; it does not
+    move the receiving modules, so an explicit `.to(device)` is required before
+    any observation or noisy action is placed on the accelerator.
+    """
     import resnet
     import unet
+    device = torch.device(device)
     raw = torch.load(path, map_location=device, weights_only=True)
     if not isinstance(raw, dict):
         raise ValueError("checkpoint is not a dictionary")
@@ -30,15 +37,31 @@ def load_checkpoint(path, device):
         for name, tensor in module.state_dict().items():
             if not torch.isfinite(tensor).all():
                 raise ValueError("nonfinite checkpoint tensor " + name)
-    return freeze(vision_encoder), freeze(noise_pred_net)
+    vision_encoder = freeze(vision_encoder.to(device))
+    noise_pred_net = freeze(noise_pred_net.to(device))
+    return vision_encoder, noise_pred_net
+
+
+def check_devices(vision_encoder, noise_pred_net, condition, actions, device):
+    """Every tensor that participates in the forward pass must live on `device`."""
+    expected = torch.device(device)
+    devices = {str(next(vision_encoder.parameters()).device),
+               str(next(noise_pred_net.parameters()).device),
+               str(condition.device), str(actions.device)}
+    if devices != {str(expected)}:
+        raise ValueError(f"device mismatch: {sorted(devices)} vs {expected}")
+    return sorted(devices)
 
 
 def encode_condition(vision_encoder, image, agent_pos):
     if not torch.isfinite(image).all():
         raise ValueError("nonfinite image tensor")
+    feature_device = next(vision_encoder.parameters()).device
+    if image.device != feature_device:
+        raise ValueError(f"image on {image.device}, encoder on {feature_device}")
     with torch.no_grad():
         image_features = vision_encoder(image)
-    features = torch.cat([image_features, agent_pos], dim=-1)
+    features = torch.cat([image_features, agent_pos.to(image_features.device)], dim=-1)
     condition = features.flatten(start_dim=1)
     if not torch.isfinite(condition).all():
         raise ValueError("nonfinite condition vector")
@@ -120,13 +143,16 @@ def resolve_device(name):
     return device
 
 
-def check_batch_independence(noise_pred_net):
+def check_batch_independence(noise_pred_net, device=None, generator=None):
+    device = torch.device(device) if device is not None else \
+        next(noise_pred_net.parameters()).device
     noise_pred_net.eval()
-    first = torch.randn(2, HORIZON, ACTION_DIM)
-    cond = torch.randn(2, CONDITION_DIM)
+    first = torch.randn(2, HORIZON, ACTION_DIM, device=device, generator=generator)
+    cond = torch.randn(2, CONDITION_DIM, device=device, generator=generator)
+    times = torch.zeros(2, device=device)
     with torch.no_grad():
-        out_single = noise_pred_net(first[:1], torch.zeros(1), global_cond=cond[:1])
-        out_batch = noise_pred_net(first, torch.zeros(2), global_cond=cond)
+        out_single = noise_pred_net(first[:1], times[:1], global_cond=cond[:1])
+        out_batch = noise_pred_net(first, times, global_cond=cond)
     gap = (out_single - out_batch[:1]).abs().max().item()
     if not np.isfinite(gap) or gap > 1e-5:
         raise ValueError("teacher forward pass is not batch independent")
@@ -140,9 +166,12 @@ class HRIAdapter:
         self.vision_encoder = vision_encoder
         self.noise_pred_net = noise_pred_net
         self.stats = stats
-        self.device = device
+        self.device = torch.device(device)
         self.legacy = legacy
         self.clip_actions = clip_actions
+        for module in (vision_encoder, noise_pred_net):
+            if next(module.parameters()).device != self.device:
+                raise ValueError("module device does not match adapter device")
 
     def new_env(self, image):
         import pusht
@@ -175,29 +204,40 @@ class HRIAdapter:
         return obs, float(reward), terminated, truncated, bool(terminated or truncated)
 
     def step(self, env, action):
-        if self.clip_actions:
-            action = np.clip(action, ACTION_LOW, ACTION_HIGH)
         obs, reward, terminated, truncated, done = self.raw_step(env, action)
         return obs, reward, done, dict(terminated=terminated, truncated=truncated)
 
-    def success(self, reward, coverage=None):
-        """Success comes from the pinned environment's own definition: block
-        goal coverage above SUCCESS_COVERAGE, signalled by `terminated`. A
-        truncation (time limit, external cap) is NOT success."""
-        return bool(reward >= SUCCESS_COVERAGE)
-
-    def decode(self, normalized_prefix):
-        physical = decode_actions(normalized_prefix, self.stats)
+    def decode_raw(self, normalized_prefix):
+        physical = np.asarray(decode_actions(normalized_prefix, self.stats))
         if not np.isfinite(physical).all():
             raise ValueError("nonfinite decoded action")
-        return [np.asarray(row, dtype=np.float64) for row in np.asarray(physical).reshape(-1, 2)]
+        return physical
 
-    def decode_raw(self, normalized_prefix):
-        return np.asarray(decode_actions(normalized_prefix, self.stats))
+    def prepare_commands(self, normalized_prefix):
+        """Single command-preparation pathway used by collection, counterfactual
+        execution, and evaluation: decode raw, record raw violations, clip once
+        if configured, then return the exact commands to execute.
 
-    def count_out_of_range(self, physical):
-        values = np.asarray(physical, dtype=np.float64)
-        return int(np.count_nonzero((values < ACTION_LOW) | (values > ACTION_HIGH))), int(values.size)
+        Counters are reported per COORDINATE for raw and executed violations, and
+        the clip fraction uses the same coordinate denominator as the raw count.
+        """
+        raw = self.decode_raw(normalized_prefix)
+        flat = raw.reshape(-1, 2)
+        invalid = (flat < ACTION_LOW) | (flat > ACTION_HIGH)
+        raw_violations = int(invalid.sum())
+        coordinates = int(invalid.size)
+        prepared = np.clip(raw, ACTION_LOW, ACTION_HIGH) if self.clip_actions else raw
+        prepared = np.asarray(prepared, dtype=np.float64)
+        executed_invalid = (prepared < ACTION_LOW) | (prepared > ACTION_HIGH)
+        return dict(raw=raw, prepared=prepared,
+                    raw_violations=raw_violations,
+                    executed_violations=int(executed_invalid.sum()),
+                    clip_fraction=raw_violations / max(coordinates, 1),
+                    coordinates=coordinates,
+                    clipped=bool(self.clip_actions))
+
+    def commands_for_execution(self, normalized_prefix):
+        return self.prepare_commands(normalized_prefix)["prepared"]
 
     def features(self, env):
         angle = float(env.block.angle)
@@ -227,11 +267,12 @@ class HRIAdapter:
         return env
 
     def execute_from_history(self, scene, history, normalized_prefix):
+        commands = self.commands_for_execution(normalized_prefix)
         env = self.replay(scene, history)
         features = []
         finished = False
         try:
-            for action in self.decode(normalized_prefix):
+            for action in commands:
                 if not finished:
                     _, _, terminated, truncated, _ = self.raw_step(env, action)
                     finished = bool(terminated or truncated)
@@ -255,9 +296,49 @@ class HRIAdapter:
                              f"gap {gap}, tol {tol})")
         return gap
 
+    def check_transition_equivalence(self, scene, history, new_action, tol=1e-9):
+        """Image environment and state environment must agree on the transition
+        produced by the same recorded prefix plus one action."""
+        state_env = self.new_env(image=False)
+        self.reset(state_env, scene)
+        try:
+            for action in history:
+                _, _, terminated, _, _ = self.raw_step(state_env, action)
+                if terminated:
+                    raise ValueError("history terminated during state replay")
+            state_before = self.signature(state_env)
+            for action in np.asarray(new_action, dtype=np.float64):
+                self.raw_step(state_env, action)
+            state_after = self.signature(state_env)
+        finally:
+            state_env.close()
+        image_env = self.new_env(image=True)
+        self.reset(image_env, scene)
+        try:
+            for action in history:
+                _, _, terminated, _, _ = self.raw_step(image_env, action)
+                if terminated:
+                    raise ValueError("history terminated during image replay")
+            image_before = self.signature(image_env)
+            for action in np.asarray(new_action, dtype=np.float64):
+                self.raw_step(image_env, action)
+            image_after = self.signature(image_env)
+        finally:
+            image_env.close()
+        before_gap = float(np.abs(state_before - image_before).max())
+        after_gap = float(np.abs(state_after - image_after).max())
+        if not (np.isfinite(before_gap) and np.isfinite(after_gap)):
+            raise ValueError("nonfinite transition comparison")
+        if max(before_gap, after_gap) > tol:
+            raise ValueError(f"image and state environments disagree "
+                             f"(before {before_gap}, after {after_gap})")
+        return dict(before=before_gap, after=after_gap)
+
     def encode_observation(self, image, agent_pos):
-        image_t = torch.from_numpy(np.asarray(image)).unsqueeze(0).to(self.device, dtype=torch.float32)
-        pos_n = normalize_data(np.asarray(agent_pos).reshape(1, -1), self.stats, key="agent_pos")
+        image_t = torch.from_numpy(np.asarray(image)).unsqueeze(0).to(
+            self.device, dtype=torch.float32)
+        pos_n = normalize_data(np.asarray(agent_pos).reshape(1, -1), self.stats,
+                               key="agent_pos")
         pos_t = torch.from_numpy(pos_n).to(self.device, dtype=torch.float32)
         cond = encode_condition(self.vision_encoder, image_t, pos_t)
         check_condition_dim(cond)
