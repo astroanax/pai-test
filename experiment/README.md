@@ -1,44 +1,106 @@
 execution pullback pilot, project-i workspace
 
-layout, all under execution-pullback/
-- experiment/config.json holds every default consumed by the code
-- experiment/core.py holds student, integration, finite differences, vjp probes, six losses, scale matching
-- experiment/hri_adapter.py holds strict checkpoint load and complete history replay
-- experiment/pilot.py holds normalizer, collect, metrics, train, evaluate
-- experiment/diagnose.py holds held out sensitivity diagnostic
-- experiment/analyze.py holds paired summary with exact discordant test and joint scene bootstrap
-- experiment/sanity.py holds algebra and synthetic backward checks
-- experiment/preflight.py checks imports, cuda, assets, exits nonzero on missing items
-- experiment/lock_protocol.py records hashes and scene ids before final outcomes are examined
-- experiment/run_comparison.sh runs matched comparison
+layout, all under execution-pullback/experiment/
+- contract.py      config validation, split checks, source/upstream/package hashing,
+                   cache-contract fingerprint, protocol id, atomic writes, output
+                   reservation, completeness/metadata requirements, file manifest
+- core.py          student, integration, finite differences, VJP probes, exact
+                   transmitted metric, six losses, scale matching
+- hri_adapter.py   strict checkpoint load, complete-history replay, flag separation
+- pilot.py         normalizer, collect, metrics, train, evaluate
+- diagnose.py      held-out geometry diagnostic on actual student errors
+- analyze.py       protocol-bound paired analysis
+- smoke.py         target-stack smoke report (required before locking)
+- sanity.py        algebra, contract, and estimator regression tests
+- preflight.py     imports, cuda, assets, manifest, config, exit status
+- lock_protocol.py protocol lock with source, upstream, and package provenance
+- run_comparison.sh locked matched comparison including reference and native-fast
+- MANIFEST.json    file manifest for transfer verification
 
-library notes from source reads and deepwiki
-- hri flow_matching example flow_pusht.py: ConditionalFlowMatcher sigma 0, x0 gaussian randn, xt target loss against ut, ConditionalUnet1D input dim 2 global cond 514, pred horizon 16 action horizon 8 obs horizon 1, resnet18 with fc replaced by identity plus replace_bn_with_gn, ema power 0.75, adamw lr 1e-4 wd 1e-6, cosine schedule 500 warmup
-- test branch in the same example uses uniform rand source with one euler step, so the pilot treats 16 step gaussian as an explicit adaptation and gates native fast versus slow before compression
-- pusht.py: PushTEnv sim 100 hz control 10 hz pd kp 100 kv 20, action space 0 to 512, observation 5 vector, image env renders 96 rgb with agent pos, dataset normalizes action and agent pos from zarr min max to minus 1 to 1, success is goal coverage above 0.95, legacy flag changes set state order then steps physics once
-- unet.py: ConditionalUnet1D takes sample BxTxC timestep global cond, sinusoidal time embedding plus film conditioning, down dims 256 512 1024 kernel 5, batch independence required for summed output vjp
-- resnet.py: get_resnet wraps torchvision resnet, fc set to identity so resnet18 output is 512 features, replace_bn_with_gn swaps every BatchNorm2d for GroupNorm with 16 features per group
-- torchcfm via deepwiki: sample_location_and_conditional_flow draws t uniform, eps gaussian, xt mu_t plus sigma eps, ut x1 minus x0 for sigma 0, models module holds mlp and unet, utils holds sampling and plotting helpers
-- requirements.txt: torch torchvision zarr diffusers gym pygame pymunk shapely opencv scikit-image scikit-video gdown matplotlib ipython torchcfm torchdyn torchsde torchdiffeq
+conventions fixed from upstream
+- training source is gaussian noise; the upstream test example uses uniform noise
+  with one euler step, so native-fast is evaluated explicitly (native_fast_* keys)
+- pred horizon 16, action dim 2, execution horizon 8, condition dim 514,
+  agent action range 0 to 512, success is block coverage above 0.95 within 300 steps
+- do not add ImageNet normalization: the HRI image environment already normalizes
+- teacher_steps must be even so the half map is well defined
 
-setup, run relative to execution-pullback/
-- place upstream checkout at external/flow_matching, record commit in assets/upstream_commit.txt
-- place teacher checkpoint at assets/flow_pusht.pth and demonstration archive under assets
-- build assets/normalizer.npz with pilot.py normalizer before training
-- weights_only tensor checkpoint loading, strict key and shape checks
+method notes
+- execution_pullback exact metric: C = B0 J_prefix, Q0(e) = ||C e||^2,
+  tr M = ||C||_F^2, built with one VJP per prefix output (16 backwards passes, no
+  extra simulator branches). This replaces the rank-4 probe sketch, which leaves
+  consequential directions unpenalized; metric_mode="sketch" keeps the probe path
+  with an audit against the exact metric and a probe-count sweep in diagnose.py
+- switch modes never mix the two metric representations; the cache records which
+  one it holds and contract.py rejects a mismatch
 
-audit record, static only, nothing executed
-- label fix: collect now saves warm student midpoint ztilde, metrics sets midpoint ztilde, target_mid y0 half map, target_end y1 second half from ztilde, teacher_end at second half from y0, suffix is half map 0.5 to 1, prefixes from at and y1
-- appendix randint bound 140 corrected to 0, 2
-- teacher_half_maps parameterized by step count instead of hardcoded 8 plus 8
-- metrics path dead code removed, suffix closure uses configured step count
-- eval noise slot reshape fixed to keep batch dim
-- check_batch_independence simplified to avoid unused tensor
-- hri_adapter imports moved inside functions so core and sanity import without the simulator stack
-- pilot inserts repository model path at build_adapter time
-- sanity torch check imports experiment.core for the project-i layout
-- preflight adds torchcfm to the required module list
-- scalar mode preserves per context trace while removing direction, matching appendix a.6
-- endpoint penalty uses full student endpoint error through jacobian_start, pullback early term uses probe projection of mid error, late term uses jacobian_end, matching equations 5 and 8
-- metric scales use global positive median over training rows, minimum 8 nonzero, never per context division
-- replay restores scene from seed and replays full physical prefix, validates signature, holds terminal feature, duplicate finite difference branch recorded
+run order
+- python experiment/preflight.py --write-manifest experiment/MANIFEST.json
+- python experiment/sanity.py --require-torch
+- python experiment/smoke.py            (must pass before locking)
+- python experiment/pilot.py normalizer --dataset <zarr> --output assets/normalizer.npz
+- python experiment/pilot.py collect --output runs/teacher_cache.npz
+- python experiment/pilot.py train --cache runs/teacher_cache.npz --mode uniform --output runs/warm.pt
+- python experiment/pilot.py collect --student runs/warm.pt --output runs/shared_cache.npz
+- python experiment/pilot.py metrics --cache runs/shared_cache.npz --limit 8 --output runs/profile_metrics.npz
+- python experiment/pilot.py metrics --cache runs/shared_cache.npz --output runs/shared_metrics.npz
+- python experiment/diagnose.py --cache runs/shared_metrics.npz --student runs/warm.pt \
+    --output runs/geometry_diagnostic.json --predictions runs/geometry_predictions.npz
+- python experiment/pilot.py train --cache runs/shared_metrics.npz --mode pullback \
+    --updates 250 --initial runs/warm.pt --output runs/profile_student.pt
+- python experiment/lock_protocol.py --confirm-no-final-results
+- bash experiment/run_comparison.sh
+
+audit fixes, all against the second friend audit
+1  analysis loads the protocol lock, requires the full method x seed x scene product
+   for both arms, rejects missing runs even when the remainder pairs, requires the
+   declared primary contrast, and refuses a degenerate bootstrap frame
+2  the lock hashes the experiment sources, the upstream model files and commit, and
+   package versions; the protocol id is written into every checkpoint, evaluation
+   row, and sidecar, and rechecked before evaluation and analysis
+3  cache contract fingerprint covers source distribution, solver, execution horizon,
+   action decoding, physical features, upstream implementation, and collection
+   episode cap; diagnose.py verifies the cache and records its lineage
+4  configured scene ranges must be pairwise disjoint; caches, evaluations, and the
+   lock are checked against the declared splits
+5  the prefix extra loss uses the marked metric half, matching the physical penalties
+6  exact transmitted metric replaces the four-probe sketch by default
+7  the diagnostic accepts a student checkpoint, measures actual mid/end/endpoint
+   errors, tests consequences along those errors, includes the identity comparator,
+   covers the late and endpoint terms, samples validation contexts across scenes,
+   and saves every prediction
+8  the reference teacher is read from the locked config, and native-fast is a
+   separate configured evaluation with its own source distribution
+9  smoke.py instantiates the adapter, loads the checkpoint strictly, resets both
+   environments, checks ranges and finiteness, compares half maps, checks a suffix
+   directional derivative against finite differences, checks replay agreement,
+   runs one training step per mode, and writes a hash-bound pass/fail report
+10 gradients use error_if_nonfinite=True; the gradient norm is logged and parameters
+   are checked before saving
+11 student collection reuses one forward for the midpoint instead of recomputing it,
+   and computes no teacher supervision at unsaved decisions
+12 outputs are reserved at command startup, written atomically, and marked
+   .incomplete on failure
+13 configuration validation rejects non-positive counts, odd or single-step
+   teachers, out-of-range execution horizons, bad epsilon, and bad optimizer
+   settings; CLI defaults use is None; development defaults use development_episodes;
+   warmup_updates was removed rather than left unused
+14 success, termination, truncation, and episode-cap exhaustion are recorded
+   separately and success requires the environment's own success signal
+15 checkpoints, evaluation rows, and sidecars carry the intrinsic mode and seed;
+   analysis verifies checkpoint and protocol metadata, not just the label string
+16 training logs base, anchor, penalty, weighted penalty, gradient norm, mid/end/
+   endpoint error magnitudes, and the zero-sensitivity fraction
+17 normalizers, cached tensors, actions, signatures, and replay comparisons are
+   finiteness-checked before any tolerance test
+18 the device is resolved once, cuda synchronization is guarded, and a cuda request
+   on a cpu-only host fails loudly
+19 out-of-range commands are counted on raw decoded actions, with executed and
+   clipped counts reported separately
+20 preflight writes and verifies a file manifest, and reports which sources are not
+   tracked or are ignored by version control
+
+not run in this workspace
+- no gpu, no torch, no simulator, and no upstream checkout are present, so nothing
+  here is executed end to end; run preflight, sanity --require-torch, and smoke.py
+  on the GPU machine before locking the protocol

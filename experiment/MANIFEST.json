@@ -1,0 +1,45 @@
+{
+  "experiment": "execution-pullback",
+  "dir": "/home/rehan/workspaces/project-i/execution-pullback/experiment",
+  "files": {
+    "core.py": "a2ff292454fa0f2a3912d946c53d8bf003c92921498e1ca03032f3146b873518",
+    "hri_adapter.py": "f573de42bfdde6258fbcb19237cf90773a4383544bddb357494d4f1fa3671d56",
+    "pilot.py": "45d04c33b63886fc6e8e70e92e312fdaf964a87baeefda62cfb1a3999f2bffe0",
+    "diagnose.py": "ab0c09a84d0dc447143f5c2e9ac8e44ec39f8e753901641ed4de43097164e762",
+    "analyze.py": "8a8214c1df93274ea0b9533d972e0bdd696307e1e284d7c9524d1960c012be42",
+    "sanity.py": "58bb67e9a8c3f92522666bfe23aae196f29337dc0a917c59ba2ee95447f036b8",
+    "preflight.py": "8984c4938b7da5845b9e21afeac810f176cff0b55913a912df95f2473c132903",
+    "lock_protocol.py": "91126b1102e05676613490a964b3a354985ba986721c5706dbdb516307f512b6",
+    "contract.py": "ee7437c3168c950f7fe2e774731108782069b25c4ee63b6e794871c3efda6333",
+    "smoke.py": "fdf45894c0eb49d478e5741e28ef33e5dcfe25db7cf7bc69aaf4b611f74121b7",
+    "run_comparison.sh": "d417a300d09816637c76bc5286b3fba8886a9a82321b2498b669439289410967",
+    "config.json": "922ebf79cd0f6a95b52e053105123855c739f0ff662881c12232b4b03b11b2ea"
+  },
+  "count": 12,
+  "upstream": {
+    "/home/rehan/workspaces/project-i/execution-pullback/external/flow_matching/external/models/unet.py": "absent",
+    "/home/rehan/workspaces/project-i/execution-pullback/external/flow_matching/external/models/resnet.py": "absent",
+    "/home/rehan/workspaces/project-i/execution-pullback/external/flow_matching/external/models/pusht.py": "absent"
+  },
+  "required_from_upstream": [
+    "external/models/unet.py",
+    "external/models/resnet.py",
+    "external/models/pusht.py"
+  ],
+  "packages": {
+    "torch": "missing: No module named 'torch'",
+    "torchvision": "missing: No module named 'torchvision'",
+    "numpy": "2.5.1",
+    "scipy": "1.18.0",
+    "pandas": "missing: No module named 'pandas'",
+    "gym": "missing: No module named 'gym'",
+    "pygame": "missing: No module named 'pygame'",
+    "pymunk": "missing: No module named 'pymunk'",
+    "shapely": "missing: No module named 'shapely'",
+    "cv2": "missing: No module named 'cv2'",
+    "skimage": "missing: No module named 'skimage'",
+    "zarr": "missing: No module named 'zarr'",
+    "diffusers": "missing: No module named 'diffusers'",
+    "imageio_ffmpeg": "missing: No module named 'imageio_ffmpeg'"
+  }
+}
