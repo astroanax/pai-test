@@ -1,0 +1,263 @@
+{
+  "passed": true,
+  "failed": [],
+  "checks": {
+    "adapter_strict_load": {
+      "ok": true,
+      "detail": {
+        "device": "cuda",
+        "clip_actions": false,
+        "encoder_device": "cuda:0",
+        "field_device": "cuda:0"
+      },
+      "seconds": 6.206
+    },
+    "device_placement": {
+      "ok": true,
+      "detail": {
+        "devices": [
+          [
+            "cuda",
+            0
+          ]
+        ],
+        "cpu_condition_rejected": true
+      },
+      "seconds": 0.001
+    },
+    "env_reset_and_step": {
+      "ok": true,
+      "detail": {
+        "image": {
+          "terminated": false,
+          "truncated": false,
+          "done": false,
+          "reward": 0.0
+        },
+        "state": {
+          "terminated": false,
+          "truncated": false,
+          "done": false,
+          "reward": 0.0
+        }
+      },
+      "seconds": 0.096
+    },
+    "teacher_half_map_consistency": {
+      "ok": true,
+      "detail": {
+        "max_gap": 0.0
+      },
+      "seconds": 0.278
+    },
+    "teacher_suffix_directional_derivative": {
+      "ok": true,
+      "detail": {
+        "analytic": -0.5396322011947632,
+        "numeric": -0.5414532423019409,
+        "relative_gap": 0.003374596814544963
+      },
+      "seconds": 0.265
+    },
+    "teacher_batch_independence": {
+      "ok": true,
+      "detail": {
+        "max_gap": 1.1920928955078125e-07
+      },
+      "seconds": 0.011
+    },
+    "exact_pullback_metric": {
+      "ok": true,
+      "detail": {
+        "shape": [
+          1,
+          32,
+          32
+        ],
+        "expected_shape": [
+          1,
+          32,
+          32
+        ],
+        "quadratic": 7.293928319995757e-06,
+        "probes": [
+          1,
+          4,
+          32
+        ]
+      },
+      "seconds": 1.005
+    },
+    "replay_and_image_state_transitions": {
+      "ok": true,
+      "detail": [
+        {
+          "scene": 10000,
+          "steps": 24,
+          "replay_gap": 0.0,
+          "pose_change": 54.806971914724905,
+          "image_state_gap": {
+            "before": 0.0,
+            "after": 0.0
+          },
+          "block_moved": true
+        },
+        {
+          "scene": 10001,
+          "steps": 24,
+          "replay_gap": 0.0,
+          "pose_change": 54.806993783458786,
+          "image_state_gap": {
+            "before": 0.0,
+            "after": 0.0
+          },
+          "block_moved": true
+        }
+      ],
+      "seconds": 0.502
+    },
+    "tiny_train_step_all_modes": {
+      "ok": true,
+      "detail": {
+        "uniform": {
+          "loss": 2.5626518726348877,
+          "penalty": 0.0,
+          "grad_norm": 0.15282779932022095
+        },
+        "prefix": {
+          "loss": 2.9851553440093994,
+          "penalty": 1.6936579942703247,
+          "grad_norm": 0.19067443907260895
+        },
+        "endpoint": {
+          "loss": 3.433919906616211,
+          "penalty": 3.4930310249328613,
+          "grad_norm": 0.3385245203971863
+        },
+        "pullback": {
+          "loss": 3.5178475379943848,
+          "penalty": 3.83345890045166,
+          "grad_norm": 0.2629026770591736
+        },
+        "identity": {
+          "loss": 3.1397242546081543,
+          "penalty": 2.326521396636963,
+          "grad_norm": 0.2418912947177887
+        },
+        "scalar": {
+          "loss": 3.386992931365967,
+          "penalty": 3.3223013877868652,
+          "grad_norm": 0.24356310069561005
+        }
+      },
+      "seconds": 0.221
+    },
+    "uniform_train_without_metrics": {
+      "ok": true,
+      "detail": {
+        "loss": 2.600264310836792,
+        "has_metric_keys": []
+      },
+      "seconds": 0.024
+    },
+    "source_conventions": {
+      "ok": true,
+      "detail": {
+        "gaussian_mean": 0.004681439138948917,
+        "gaussian_std": 0.9960386157035828,
+        "uniform_range": [
+          2.2864942366140895e-05,
+          0.9999688267707825
+        ],
+        "symmetric_range": [
+          -0.9999784231185913,
+          0.9999725818634033
+        ]
+      },
+      "seconds": 0.002
+    }
+  },
+  "compute_env": {
+    "cudnn_disabled": true,
+    "flag": "EXECPB_DISABLE_CUDNN"
+  },
+  "cudnn_health": {
+    "healthy": false,
+    "error": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nRuntimeError: cuDNN error: CUDNN_STATUS_NOT_INITIALIZED\n",
+    "recommendation": "set EXECPB_DISABLE_CUDNN=1 to run the experiment with cuDNN disabled"
+  },
+  "source_hashes": {
+    "experiment/core.py": "0bb6dadaaffe6f3ccfae4c1a0d4f61f7b72e5349960207628473181955465638",
+    "experiment/hri_adapter.py": "f7844af7ff6c6b49b2dda90b2789d4b494a394476eb5e7dcf5e81f86e6e8d6d1",
+    "experiment/pilot.py": "aa01f4ecb44aa1254a84648060f9d1d6ee8fd4f7d29ebee98e73689813ba07cc",
+    "experiment/diagnose.py": "5a5745ea55e42b33f412fe2d4ff4b8bb2d9fbc1b8a1d8cd83004a3b006d6065d",
+    "experiment/analyze.py": "a125c426f41fc17d59150f4c3cfd6741ef6c6674953f448fc3d4eab28216d714",
+    "experiment/sanity.py": "5a1072835e3377fc8cf60f0d20b479b3419913895a71552f7c71ea975b0f487c",
+    "experiment/preflight.py": "8cb773a8003b00e07fc6b1a426234e1d82f492a166439d28ebc1d33f259ebc69",
+    "experiment/lock_protocol.py": "1a94a74b9371834d1cfaec33a62ec81990aa390ba313440807261e00cd0785f5",
+    "experiment/contract.py": "da32497f797a8160bcc65794f800516e79fa5c2e8012b972401b581f9800ae64",
+    "experiment/smoke.py": "61378f93199587346934ade9d1484cabb410817e5b2013e5441f4fe2654a2251",
+    "experiment/run_comparison.sh": "4c5a1dd774935e0816116a599cd601a265decbc4a1ef4b2ebe6a444a013293b1",
+    "experiment/vertical_test.sh": "23adef5db78b4f26b9bb87a8d98afd9d578c9a5bb60d9619e35eaacc76748269",
+    "experiment/config.json": "a7b2adfc685a40479ec645733f868cb7112b8e35c13d8ee7c57b3228206de9d8"
+  },
+  "asset_hashes": {
+    "checkpoint": "a4e16aebb2bcddc32846109dd7bd61a88d9f31bd0791357e76268958b5bd1096",
+    "normalizer": "d1e143627b105620a2e76cd5ee37b1b7abf2ebaa5d818c9bf543ef8530d63217"
+  },
+  "device": "cuda",
+  "teacher_steps": 16,
+  "execute_steps": 8,
+  "metric_mode": "exact",
+  "manifest": {
+    "dir": "/home/b231090pe/rehan/execution-pullback-test/experiment",
+    "source": "no_git",
+    "missing": [],
+    "tracked": [],
+    "untracked": [
+      "core.py",
+      "hri_adapter.py",
+      "pilot.py",
+      "diagnose.py",
+      "analyze.py",
+      "sanity.py",
+      "preflight.py",
+      "lock_protocol.py",
+      "contract.py",
+      "smoke.py",
+      "run_comparison.sh",
+      "vertical_test.sh",
+      "config.json"
+    ],
+    "ignored": [],
+    "complete": true,
+    "delivery_risk": [
+      "core.py",
+      "hri_adapter.py",
+      "pilot.py",
+      "diagnose.py",
+      "analyze.py",
+      "sanity.py",
+      "preflight.py",
+      "lock_protocol.py",
+      "contract.py",
+      "smoke.py",
+      "run_comparison.sh",
+      "vertical_test.sh",
+      "config.json"
+    ],
+    "note": "no git repository here; ship the explicit manifest and verify it after transfer"
+  },
+  "packages": {
+    "torch": "2.6.0+cu124",
+    "torchvision": "0.21.0+cu124",
+    "numpy": "2.2.6",
+    "scipy": "1.15.3",
+    "gym": "0.26.2",
+    "pymunk": "present",
+    "pygame": "2.6.1",
+    "imageio_ffmpeg": "0.6.0"
+  },
+  "schema_version": 2,
+  "timestamp": 1789511728.7029839
+}

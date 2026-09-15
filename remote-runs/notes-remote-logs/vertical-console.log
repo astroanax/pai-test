@@ -1,0 +1,111 @@
+[vertical] run dir: runs-vertical
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+sanity {"metric_subset_spread": {"scenes": [20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007], "n": 16}, "warm_provenance": {"warm_start_accepted": true, "unlocked_metric_rejected": true}, "linear_algebra": {"finite_difference_gap": 1.5215562143566785e-10, "quadratic": 0.17000000000000004, "trace": 7.25}, "config_validation": ["teacher_steps=0: invalid configuration test: teacher_steps must b", "teacher_steps=15: invalid configuration test: teacher_steps must b", "execute_steps=0: invalid configuration test: execute_steps must b", "execute_steps=17: invalid configuration test: execute_steps must s", "episode_steps=-1: invalid configuration test: episode_steps must b", "num_probes=0: invalid configuration test: num_probes must be a", "batch_size=127: invalid configuration test: batch_size must be e", "finite_difference_epsilon=0.0: invalid configuration test: finite_difference_ep", "learning_rate=0.0: invalid configuration test: learning_rate must b", "metric_weight=-1: invalid configuration test: metric_weight must b", "validation_metric_contexts=0: invalid configuration test: validation_metric_co", "native_fast_steps=0: invalid configuration test: native_fast_steps mu", "source=gauss: invalid configuration test: source must be gauss", "metric_mode=approx: invalid configuration test: metric_mode must be ", "validation_scene_start overlap rejected", "test_scene_start overlap rejected"], "spearman_ties": {"tie_aware": 0.6666666666666666, "double_argsort": 0.7, "constant_reported_as_nan": true}, "manifest": {"files": 13, "verified": 13, "delivery_risk": ["core.py", "hri_adapter.py", "pilot.py", "diagnose.py"]}, "producer_consumer": {"label_cache_contexts": 6, "splits": {"train": 4, "validation": 2}, "metric_required_rejected": true, "subset": {"train": 4, "validation": 2}, "label_context_keys": ["condition", "midpoint", "noise", "target_end", "target_mid", "teacher_end"], "metric_cache_contexts": 4, "contract_drift_rejected": true, "metric_mode_change_rejected": true}, "reserve_and_completion": {"reserved": true, "completed": true, "incomplete_after_failure": true}, "protocol_and_analysis": {"fresh_lock_verified": true, "missing_artifact_rejected": true, "stale_source_rejected": true, "config_drift_rejected": true, "complete_ok": true, "joint_missing_pair_rejected": true, "non_binary_success_rejected": true, "two_seeds_accepted": [["endpoint", 0], ["endpoint", 1], ["pullback", 0], ["pullback", 1]], "duplicate_run_rejected": true}, "empty_metric_count": {"empty_count_falls_back_to_full_batch": true}, "device_keys": {"cuda_equals_cuda0": true}, "torch_checks": {"linear_composition_max_gap": 0.0, "quadratic_matches_manual": 0.3963330388069153, "exact_trace_matches": true, "sketch_shape": [1, 4, 32], "sketch_trace_ratio": 0.9311273693622228, "prefix_error_rejected": true, "prefix_selection": {"marked_only": 0.0, "all_examples": 5000.0}, "uniform_without_metrics_ok": 0.0, "pullback_without_metric_rejected": true, "nonfinite_gradient_rejected": true}}
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[smoke] compute: {"cudnn_disabled": true, "flag": "EXECPB_DISABLE_CUDNN"}
+[smoke] cudnn: {"healthy": false, "error": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nRuntimeError: cuDNN error: CUDNN_STATUS_NOT_INITIALIZED\n", "recommendation": "set EXECPB_DISABLE_CUDNN=1 to run the experiment with cuDNN disabled"}
+[smoke] sources: {"dir": "/home/b231090pe/rehan/execution-pullback-test/experiment", "source": "no_git", "missing": [], "tracked": [], "untracked": ["core.py", "hri_adapter.py", "pilot.py", "diagnose.py", "analyze.py", "sanity.py", "preflight.py", "lock_protocol.py", "contract.py", "smoke.py", "run_comparison.sh", "vertical_test.sh", "config.json"], "ignored": [], "complete": true, "delivery_risk": ["core.py", "hri_adapter.py", "pilot.py", "diagnose.py", "analyze.py", "sanity.py", "preflight.py", "lock_protocol.py", "contract.py", "smoke.py", "run_comparison.sh", "vertical_test.sh", "config.json"], "note": "no git repository here; ship the explicit manifest and verify it after transfer"}
+[smoke] device: cuda
+[smoke] adapter_strict_load: ok
+[smoke] device_placement: ok
+[smoke] env_reset_and_step: ok
+[smoke] teacher_half_map_consistency: ok
+[smoke] teacher_suffix_directional_derivative: ok
+[smoke] teacher_batch_independence: ok
+[smoke] exact_pullback_metric: ok
+[smoke] replay_and_image_state_transitions: ok
+[smoke] tiny_train_step_all_modes: ok
+[smoke] uniform_train_without_metrics: ok
+[smoke] source_conventions: ok
+[smoke] PASS -> runs-vertical/smoke_report.json
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+wrote cache runs-vertical/teacher_cache.npz contexts 8 splits {'train': 2, 'validation': 2}
+[train] mode uniform: label-only path, no Jacobians, no transported metric, no scale estimation
+wrote student runs-vertical/warm.pt mode uniform
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+wrote cache runs-vertical/shared_cache.npz contexts 8 splits {'train': 2, 'validation': 2}
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[metrics] selected 4 train + 0 validation contexts of 8 (metric_mode=exact); one repeated-branch determinism check per context
+[metrics] first context took 1.39s; projected 0.1 min for 4 contexts
+wrote metrics runs-vertical/profile_metrics.npz contexts 4
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[metrics] selected 4 train + 4 validation contexts of 8 (metric_mode=exact); one repeated-branch determinism check per context
+[metrics] first context took 1.73s; projected 0.2 min for 8 contexts
+wrote metrics runs-vertical/shared_metrics.npz contexts 8
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+Traceback (most recent call last):
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/diagnose.py", line 347, in <module>
+    raise SystemExit(main())
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/diagnose.py", line 167, in main
+    exact = exact_metric(context)
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/diagnose.py", line 125, in exact_metric
+    return pullback_metric_exact(suffix_of(context, cond), target, jac_start,
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/core.py", line 183, in pullback_metric_exact
+    completed = suffix(variable)
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/diagnose.py", line 120, in suffix
+    return teacher_half_from(variable, adapter.noise_pred_net, cond, steps)
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/hri_adapter.py", line 106, in teacher_half_from
+    return integrate(make_field(noise_pred_net), midpoint, condition, 0.5, 1.0, second)
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/core.py", line 49, in integrate
+    result = result + delta * field(result, times, condition)
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/hri_adapter.py", line 89, in field
+    return noise_pred_net(latent, times, global_cond=condition)
+  File "/home/b231090pe/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1739, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/b231090pe/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1750, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/b231090pe/rehan/execution-pullback-test/external/flow_matching/external/models/unet.py", line 254, in forward
+    x = resnet(x, global_feature)
+  File "/home/b231090pe/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1739, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/b231090pe/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1750, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/b231090pe/rehan/execution-pullback-test/external/flow_matching/external/models/unet.py", line 118, in forward
+    out = self.blocks[0](x)
+  File "/home/b231090pe/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1739, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/b231090pe/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1750, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/b231090pe/rehan/execution-pullback-test/external/flow_matching/external/models/unet.py", line 79, in forward
+    return self.block(x)
+  File "/home/b231090pe/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1739, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/b231090pe/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1750, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/b231090pe/.local/lib/python3.10/site-packages/torch/nn/modules/container.py", line 250, in forward
+    input = module(input)
+  File "/home/b231090pe/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1739, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/b231090pe/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1750, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/b231090pe/.local/lib/python3.10/site-packages/torch/nn/modules/conv.py", line 375, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+  File "/home/b231090pe/.local/lib/python3.10/site-packages/torch/nn/modules/conv.py", line 370, in _conv_forward
+    return F.conv1d(
+RuntimeError: cuDNN error: CUDNN_STATUS_NOT_INITIALIZED
+[vertical] FAIL: diagnostic

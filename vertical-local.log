@@ -1,0 +1,3 @@
+[vertical] run dir: runs-local
+[vertical] FAIL: preflight
+VERTICAL_LOCAL_EXIT=1

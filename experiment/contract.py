@@ -8,7 +8,8 @@ import numpy as np
 
 SOURCE_FILES = ["core.py", "hri_adapter.py", "pilot.py", "diagnose.py",
                 "analyze.py", "sanity.py", "preflight.py", "lock_protocol.py",
-                "contract.py", "smoke.py", "run_comparison.sh", "config.json"]
+                "contract.py", "smoke.py", "run_comparison.sh", "vertical_test.sh",
+                "config.json"]
 UPSTREAM_FILES = ["external/models/unet.py", "external/models/resnet.py",
                   "external/models/pusht.py"]
 PACKAGES = ["torch", "torchvision", "numpy", "scipy", "pandas", "gym",
@@ -30,6 +31,58 @@ SCENE_RANGES = {
     "development": ("development_scene_start", "development_episodes"),
     "test": ("test_scene_start", "test_episodes"),
 }
+CUDNN_ENV_FLAG = "EXECPB_DISABLE_CUDNN"
+
+
+def cudnn_healthy(device="cuda", timeout_s=60):
+    """Probe whether cuDNN convolutions actually run on this host.
+
+    Importing torch succeeds even when the driver/cuDNN combination cannot
+    initialize; this probe catches that before the experiment spends its
+    budget. Returns a dict with healthy True/False and a recommendation.
+    """
+    import subprocess as _sp
+    import sys as _sys
+    code = (
+        "import torch; "
+        "x = torch.randn(1,3,32,32).cuda(); w = torch.randn(8,3,3,3).cuda(); "
+        "torch.nn.functional.conv2d(x, w); print('conv_ok')"
+    )
+    try:
+        out = _sp.run([_sys.executable, "-c", code], capture_output=True,
+                      text=True, timeout=timeout_s)
+    except Exception as error:
+        return dict(healthy=False, error=f"probe failed: {error}",
+                    recommendation="rerun on a host with working cuDNN")
+    if "conv_ok" in out.stdout:
+        return dict(healthy=True)
+    tail = (out.stderr or out.stdout)[-800:]
+    return dict(healthy=False, error=tail,
+                recommendation="set EXECPB_DISABLE_CUDNN=1 to run the "
+                               "experiment with cuDNN disabled")
+
+
+def cudnn_disabled():
+    import os as _os
+    return _os.environ.get(CUDNN_ENV_FLAG, "").strip() in ("1", "true", "yes")
+
+
+def apply_compute_env(device="cuda"):
+    """Apply the compute environment: disable cuDNN process-wide when requested.
+
+    cuDNN is enabled by default; only an explicit EXECPB_DISABLE_CUDNN=1 opts
+    out. The choice is recorded in every smoke report and student sidecar so a
+    fallback run is never mistaken for a full-cuDNN run. Returns the flag used.
+    """
+    import os as _os
+    disabled = cudnn_disabled()
+    if disabled:
+        import torch as _torch
+        _torch.backends.cudnn.enabled = False
+        _torch.backends.cudnn.benchmark = False
+    return dict(cudnn_disabled=bool(disabled), flag=CUDNN_ENV_FLAG)
+
+
 POSITIVE_INTS = ["teacher_steps", "execute_steps", "episode_steps",
                  "contexts_per_episode", "batch_size", "width", "num_probes",
                  "metric_contexts", "validation_metric_contexts", "updates",
@@ -556,12 +609,13 @@ def select_split(verified, split):
     return [c for c in verified["contexts"] if c["split"] == split]
 
 
-def metric_subset(verified, config, limit=None):
+def metric_subset(verified, config, limit=None, seed=915):
     """Pick the fixed metric subset BEFORE any derivative work.
 
-    The planned budget is `metric_contexts` training rows plus
-    `validation_metric_contexts` validation rows, spread across scenes. Set
-    `limit` for a small profiling run.
+    Rows are spread round-robin across scenes with a fixed seed, so the subset
+    cannot concentrate in the earliest collected episodes. The planned budget is
+    `metric_contexts` training rows plus `validation_metric_contexts` validation
+    rows. Set `limit` for a small profiling run.
     """
     train = select_split(verified, "train")
     validation = select_split(verified, "validation")
@@ -569,9 +623,32 @@ def metric_subset(verified, config, limit=None):
         if limit < 1:
             raise ValueError("limit must be >= 1")
         return train[:limit], []
-    n_train = min(int(config["metric_contexts"]), len(train))
-    n_validation = min(int(config["validation_metric_contexts"]), len(validation))
-    return (train[:n_train], validation[:n_validation])
+
+    def spread(rows, count):
+        if not rows or count < 1:
+            return []
+        by_scene = {}
+        for row in rows:
+            by_scene.setdefault(int(row["scene"]), []).append(row)
+        rng = np.random.default_rng(seed)
+        scenes = sorted(by_scene)
+        rng.shuffle(scenes)
+        picked = []
+        round_robin = [list(by_scene[s]) for s in scenes]
+        for group in round_robin:
+            rng.shuffle(group)
+        index = 0
+        while len(picked) < min(count, len(rows)):
+            for group in round_robin:
+                if index < len(group) and len(picked) < min(count, len(rows)):
+                    picked.append(group[index])
+            index += 1
+            if index > max(len(group) for group in round_robin):
+                break
+        return picked
+
+    return (spread(train, int(config["metric_contexts"])),
+            spread(validation, int(config["validation_metric_contexts"])))
 
 
 def verify_current_protocol(protocol, config, config_path, repository=None,
@@ -616,7 +693,11 @@ def verify_current_protocol(protocol, config, config_path, repository=None,
                       ("cache", "cache_sha256"), ("warm_start", "warm_start_sha256")):
         recorded = protocol.get(key)
         path = protocol.get(name if name != "warm_start" else "warm_start")
-        if recorded and path and os.path.exists(path) and sha256_file(path) != recorded:
+        if not recorded or not path:
+            problems.append(f"{name} is not recorded in the lock")
+        elif not os.path.exists(path):
+            problems.append(f"{name} is missing at {path}")
+        elif sha256_file(path) != recorded:
             problems.append(f"{name} bytes differ from the lock")
     if problems:
         raise ProtocolError("protocol lock is stale for stage " + stage + ": " +
@@ -636,8 +717,23 @@ def load_protocol(path, expect_id=None):
 
 
 def verify_student_provenance(payload, protocol, config, path):
-    """A checkpoint must belong to the active protocol and its own metadata."""
+    """A checkpoint must belong to the active protocol and its own metadata.
+
+    The unlocked warm start (protocol_id None, label-only mode) is a legitimate
+    input to locked fine-tuning: it predates the lock, so lock comparisons are
+    skipped and only the metric-mode contract and file existence are checked.
+    """
     problems = []
+    if protocol is not None and payload.get("protocol_id") is None and \
+            payload.get("mode") in ("uniform", "prefix"):
+        # load_student already proved the file loads; only the metric contract
+        # matters here
+        if payload.get("metric_mode", config.get("metric_mode", "exact")) != \
+                config.get("metric_mode", "exact"):
+            raise ProtocolError("warm-start checkpoint mismatch for " + str(path) +
+                                ": warm-start metric mode differs from the "
+                                "configuration")
+        return True
     if protocol is not None:
         if payload.get("protocol_id") != protocol.get("protocol_id"):
             problems.append(f"checkpoint protocol id {payload.get('protocol_id')} "

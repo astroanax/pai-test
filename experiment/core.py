@@ -263,7 +263,9 @@ def objective(student, batch, mode, execute_steps, scales=None, metric_weight=0.
     endpoint_error = full_end - batch["teacher_end"]
     anchor = endpoint_error.square().mean()
     penalty = base.new_zeros(())
-    selected = slice(None, metric_count)
+    # metric_count == 0 (no marked rows in this batch) falls back to the full
+    # batch: an empty mean would be NaN and silently poison the update.
+    selected = slice(None, metric_count) if metric_count else slice(None)
     if mode == "prefix":
         early = mid_error[selected, :execute_steps]
         late = end_error[selected, :execute_steps]
@@ -310,27 +312,43 @@ def objective(student, batch, mode, execute_steps, scales=None, metric_weight=0.
 
 
 def metric_scales(jacobian_start, jacobian_end, metric, metric_mode="exact"):
-    """Global training-only median of positive metric traces."""
+    """Global training-only median of positive metric traces.
+
+    Each scale needs at least 3 positive traces to be defined at all; below 8
+    the support is thin and the scale is flagged low_support so a reader knows
+    the corresponding comparison rests on few sensitive contexts. Aborting on
+    thin-but-nondegenerate support would turn legitimate free-space-heavy data
+    into a crash; the flag preserves the signal instead.
+    """
     first = jacobian_start.square().sum((1, 2))
     last = jacobian_end.square().sum((1, 2))
     sketch = metric_mode != "exact"
     transported = pullback_trace(metric, sketch=sketch)
 
-    def positive_median(values):
+    def positive_median(values, name):
         positive = values[values > 1e-12]
-        if positive.numel() < 8:
+        count = int(positive.numel())
+        if count < 3:
             raise ValueError(
-                "too few nonzero sensitivity labels (need >= 8 positive traces); "
-                "stop the metric experiment and inspect the cache")
-        return float(positive.median().item())
+                f"too few nonzero sensitivity labels for the {name} scale "
+                f"({count} positive traces); stop the metric experiment and "
+                "inspect the cache")
+        return float(positive.median().item()), count
 
-    scales = {"endpoint": positive_median(first),
-              "identity": positive_median(0.5 * (first + last)),
-              "pullback": positive_median(0.5 * (transported + last))}
+    scales = {}
+    support = {}
+    scales["endpoint"], support["endpoint"] = positive_median(first, "endpoint")
+    both = 0.5 * (first + last)
+    scales["identity"], support["identity"] = positive_median(both, "identity")
+    pulled = 0.5 * (transported + last)
+    scales["pullback"], support["pullback"] = positive_median(pulled, "pullback")
+    low_support = sorted(name for name, count in support.items() if count < 8)
     stats = dict(metric_mode=metric_mode,
                  zero_sensitivity_fraction=float(
                      (transported <= 1e-12).float().mean().item()),
                  n_positive_transported=int((transported > 1e-12).sum().item()),
+                 support=support,
+                 low_support=low_support,
                  n_rows=int(len(first)),
                  endpoint_median=scales["endpoint"],
                  identity_median=scales["identity"],

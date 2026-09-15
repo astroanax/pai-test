@@ -60,21 +60,23 @@ def run(config, device, output, modes):
         actions = torch.randn(1, 16, 2, device=device)
         report = check_devices(adapter.vision_encoder, adapter.noise_pred_net, cond,
                                actions, device)
-        mismatch = False
-        try:
-            check_devices(adapter.vision_encoder, adapter.noise_pred_net,
-                          cond.cpu(), actions, device)
-        except ValueError:
-            mismatch = True
-        assert mismatch, "cpu condition was not rejected on a cuda adapter"
-        return dict(devices=report, cpu_condition_rejected=True)
+        mismatch = True
+        if str(device).startswith("cuda"):
+            mismatch = False
+            try:
+                check_devices(adapter.vision_encoder, adapter.noise_pred_net,
+                              cond.cpu(), actions, device)
+            except ValueError:
+                mismatch = True
+            assert mismatch, "cpu condition was not rejected on a cuda adapter"
+        return dict(devices=report, cpu_condition_rejected=mismatch)
     record("device_placement", devices)
 
     def envs():
         out = {}
         for image in (True, False):
             env = adapter.new_env(image=image)
-            _, _ = adapter.reset(env, config["development_scene_start"])
+            obs, _ = adapter.reset(env, config["development_scene_start"])
             if image:
                 cond = adapter.encode_observation(obs["image"], obs["agent_pos"])
                 state["condition"] = cond
@@ -158,7 +160,8 @@ def run(config, device, output, modes):
                                      state["condition"], config["teacher_steps"])
         metric = pullback_metric_exact(suffix, target, jacobian,
                                        config["execute_steps"])
-        expected = (1, physical_dim, 16 * 2)
+        expected = (target.shape[0], jacobian.shape[1],
+                    target.shape[1] * target.shape[2])
         assert tuple(metric.shape) == expected, (metric.shape, expected)
         assert torch.isfinite(metric).all(), "nonfinite exact metric"
         error = torch.randn_like(target) * 0.01
@@ -214,10 +217,12 @@ def run(config, device, output, modes):
                      teacher_end=torch.randn(4, 16, 2, device=device))
         if any(m in modes for m in ("endpoint", "pullback", "identity", "scalar")):
             physical_dim = 4 * config["execute_steps"]
-            batch["jacobian_start"] = torch.randn(4, physical_dim, 16, device=device) * 0.05
-            batch["jacobian_end"] = torch.randn(4, physical_dim, 16, device=device) * 0.05
-            batch["metric_exact"] = torch.randn(4, physical_dim, 32, device=device) * 0.05
-            batch["probes"] = torch.randn(4, config["num_probes"], 32, device=device) * 0.05
+            prefix_dim = config["execute_steps"] * 2
+            flat_dim = 16 * 2
+            batch["jacobian_start"] = torch.randn(4, physical_dim, prefix_dim, device=device) * 0.05
+            batch["jacobian_end"] = torch.randn(4, physical_dim, prefix_dim, device=device) * 0.05
+            batch["metric_exact"] = torch.randn(4, physical_dim, flat_dim, device=device) * 0.05
+            batch["probes"] = torch.randn(4, config["num_probes"], flat_dim, device=device) * 0.05
         scales = {"endpoint": 1.0, "identity": 1.0, "pullback": 1.0}
         optimizer = torch.optim.AdamW(student.parameters(), lr=1e-4)
         out = {}
@@ -283,6 +288,8 @@ def run(config, device, output, modes):
 def finish(checks, assets, config, output):
     failed = sorted(name for name, value in checks.items() if not value["ok"])
     report = dict(passed=not failed, failed=failed, checks=checks,
+                  compute_env=C.apply_compute_env(),
+                  cudnn_health=C.cudnn_healthy(str(config.get("device"))),
                   source_hashes=C.source_hashes(), asset_hashes=assets,
                   device=str(config.get("device")),
                   teacher_steps=config["teacher_steps"],
@@ -312,7 +319,11 @@ def main():
                                  "identity", "scalar"])
     args = parser.parse_args()
     config = load_config(args.config)
+    compute = C.apply_compute_env(args.device or config["device"])
     device = resolve_device(args.device or config["device"])
+    health = C.cudnn_healthy(str(device))
+    print("[smoke] compute: " + json.dumps(compute))
+    print("[smoke] cudnn: " + json.dumps(health))
     C.reserve_outputs([args.output])
     print("[smoke] sources: " + json.dumps(C.check_manifest()))
     print("[smoke] device: " + str(device))

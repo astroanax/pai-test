@@ -51,15 +51,31 @@ def load_student(path, config, device):
 def protocol_for(args, config):
     """Load the lock and revalidate every fingerprint against the current tree.
 
-    Unlocked execution is permitted only for explicitly designated development
-    stages (`--allow-unlocked`), never for final evaluation or analysis.
+    Final evaluation always requires the lock. Training requires it except for
+    the warm start (no --initial), which predates the lock by construction.
+    Collection, metrics, and diagnostics may run unlocked explicitly.
     """
     path = getattr(args, "protocol", None)
+    command = getattr(args, "command", None)
+    if command == "evaluate" and not path:
+        raise C.ProtocolError(
+            "evaluate requires --protocol runs/protocol_locked.json; "
+            "unlocked test evaluation is not permitted")
+    if command == "train" and not path:
+        if getattr(args, "initial", None) is not None:
+            raise C.ProtocolError(
+                "fine-tuning (--initial ...) requires --protocol "
+                "runs/protocol_locked.json")
+        if getattr(args, "allow_unlocked", False):
+            return None, None
+        raise C.ProtocolError(
+            "train: pass --protocol runs/protocol_locked.json, or "
+            "--allow-unlocked for the warm start")
     if not path:
         if getattr(args, "allow_unlocked", False):
             return None, None
         raise C.ProtocolError(
-            f"{args.command}: pass --protocol runs/protocol_locked.json, or "
+            f"{command}: pass --protocol runs/protocol_locked.json, or "
             "--allow-unlocked for a development stage")
     protocol = C.load_protocol(path)
     C.verify_current_protocol(protocol, config, args.config,
@@ -71,7 +87,7 @@ def cmd_normalizer(args, config, device):
     import zarr
 
     def produce():
-        store = zarr.open(args.dataset, "r")
+        store = zarr.open(store=args.dataset, mode="r")
         action = np.asarray(store["data"]["action"][:], dtype=np.float64).reshape(-1, 2)
         state = np.asarray(store["data"]["state"][:, :2], dtype=np.float64).reshape(-1, 2)
         if not (np.isfinite(action).all() and np.isfinite(state).all()):
@@ -121,16 +137,20 @@ def _collect_episode(adapter, config, device, scene, student, rng, split,
                 target_end = behavior
                 teacher_end = behavior
             else:
+                # behaviour needs only the two student steps; teacher targets are
+                # computed solely for decisions that are actually stored
                 behavior, midpoint = sample_with_midpoint(noise_t, cond, student)
                 student_mid = midpoint.detach()
-                y0, _ = teacher_half_maps(adapter.noise_pred_net, noise_t, cond,
-                                          config["teacher_steps"])
-                teacher_end = teacher_half_from(y0, adapter.noise_pred_net, cond,
-                                                config["teacher_steps"])
-                target_mid = y0
-                # y1 is the teacher answer at the STUDENT's own midpoint
-                target_end = teacher_half_from(student_mid, adapter.noise_pred_net,
-                                               cond, config["teacher_steps"])
+                y0 = target_mid = target_end = teacher_end = None
+                if keep:
+                    y0, _ = teacher_half_maps(adapter.noise_pred_net, noise_t, cond,
+                                              config["teacher_steps"])
+                    teacher_end = teacher_half_from(y0, adapter.noise_pred_net, cond,
+                                                    config["teacher_steps"])
+                    target_mid = y0
+                    # y1 is the teacher answer at the STUDENT's own midpoint
+                    target_end = teacher_half_from(student_mid, adapter.noise_pred_net,
+                                                   cond, config["teacher_steps"])
         context = None
         if keep:
             context = {"scene": scene, "split": split, "decision": decision,
@@ -297,7 +317,8 @@ def cmd_metrics(args, config, device):
     if not np.isfinite(repeat_gap) or repeat_gap > 1e-6:
         raise ValueError(f"repeated branch disagreement at scene {scene}: "
                          f"{repeat_gap}")
-    meta = dict(schema_version=C.SCHEMA_VERSION, metric_mode=metric_mode,
+    meta = dict(schema_version=C.SCHEMA_VERSION, mode="shared",
+                metric_mode=metric_mode,
                 num_probes=config["num_probes"], epsilon=eps,
                 counts=dict(train=len(train_rows), validation=len(validation_rows),
                             total=len(out)),
@@ -336,7 +357,10 @@ def batch_from_contexts(contexts, indices, device, metric_mode, need_metric):
 def cmd_train(args, config, device):
     protocol, protocol_id = protocol_for(args, config)
     needs_metric = mode_needs_metric(args.mode)
-    verified = C.verify_label_cache(args.cache, config, expect_mode="shared",
+    # the warm start trains from the teacher cache (mode "teacher"); only metric
+    # modes require the shared student-collected cache
+    verified = C.verify_label_cache(args.cache, config,
+                                    expect_mode="shared" if needs_metric else None,
                                     require_metric=needs_metric)
     train_contexts = C.select_split(verified, "train")
     if not train_contexts:
@@ -360,6 +384,11 @@ def cmd_train(args, config, device):
             torch.from_numpy(metric).float(), metric_mode=metric_mode)
         print("[train] scales " + json.dumps(scales) + " stats " +
               json.dumps(scale_stats))
+        if scale_stats.get("low_support"):
+            print("[train] WARNING: thin sensitivity support for scales " +
+                  json.dumps(scale_stats["low_support"]) + " with support " +
+                  json.dumps(scale_stats["support"]) +
+                  "; the corresponding comparison rests on few contexts")
     seed_state = torch.load(args.initial, map_location=device,
                             weights_only=True) if args.initial else None
     if seed_state is not None:
@@ -370,10 +399,11 @@ def cmd_train(args, config, device):
                                   weight_decay=config["weight_decay"])
     rng = np.random.default_rng(args.seed)
     n = len(train_contexts)
-    metric_rows = set()
-    if needs_metric:
-        metric_rows = set(rng.choice(n, size=min(n, config["metric_contexts"]),
-                                     replace=False).tolist())
+    # the marked pool is drawn identically for every mode so all arms see the
+    # same minibatch streams; label-only modes simply apply their penalty to
+    # whichever rows land in the marked half
+    metric_rows = set(rng.choice(n, size=min(n, config["metric_contexts"]),
+                                 replace=False).tolist())
     student.train()
     log = []
     grad_norms = []
@@ -427,12 +457,14 @@ def cmd_train(args, config, device):
                    cache_sha256=C.sha256_file(args.cache),
                    needs_metric=bool(needs_metric),
                    log=log, grad_norm_mean=float(np.mean(grad_norms)),
-                   grad_norm_max=float(np.max(grad_norms)))
+                   grad_norm_max=float(np.max(grad_norms)),
+                   compute_env=C.apply_compute_env())
     C.atomic_save_torch(args.output, payload)
     C.write_meta(args.output + ".meta.json",
                  dict(kind="student", mode=args.mode, seed=args.seed,
                       updates=args.updates, metric_mode=metric_mode,
-                      protocol_id=protocol_id, scales=scales,
+                      protocol_id=protocol_id,
+                      compute_env=C.apply_compute_env(), scales=scales,
                       scale_stats=scale_stats, needs_metric=bool(needs_metric),
                       grad_norm_mean=float(np.mean(grad_norms)),
                       source_hashes=C.source_hashes()))
@@ -553,6 +585,7 @@ def cmd_evaluate(args, config, device):
                 "checkpoint_sha256": checkpoint_hash}) + "\n")
     C.write_meta(args.output.replace(".jsonl", ".meta.json"),
                  dict(kind="evaluation", alias=args.name,
+                      compute_env=C.apply_compute_env(),
                       intrinsic_mode=intrinsic_mode, intrinsic_seed=intrinsic_seed,
                       checkpoint_sha256=checkpoint_hash, protocol_id=protocol_id,
                       split=split, expected_split=split, scenes=scenes,
@@ -608,6 +641,7 @@ def main():
     entry.add_argument("--development", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
+    compute = C.apply_compute_env(args.device or config["device"])
     device = resolve_device(args.device or config["device"])
     if args.command == "train":
         if args.updates is None:
@@ -642,6 +676,8 @@ def main():
     else:
         if output:
             C.complete_output(output)
+            if meta_path:
+                C.complete_output(meta_path)
     return 0
 
 

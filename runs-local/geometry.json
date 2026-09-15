@@ -1,0 +1,421 @@
+{
+  "cache": "shared_metrics.npz",
+  "cache_sha256": "4ca914a77ca953c3c8532abcac2908f7ddd8ce7693c5b6850356ada39c7e0159",
+  "cache_lineage": {
+    "source_hashes": {
+      "experiment/core.py": "0bb6dadaaffe6f3ccfae4c1a0d4f61f7b72e5349960207628473181955465638",
+      "experiment/hri_adapter.py": "f7844af7ff6c6b49b2dda90b2789d4b494a394476eb5e7dcf5e81f86e6e8d6d1",
+      "experiment/pilot.py": "aa01f4ecb44aa1254a84648060f9d1d6ee8fd4f7d29ebee98e73689813ba07cc",
+      "experiment/diagnose.py": "5a5745ea55e42b33f412fe2d4ff4b8bb2d9fbc1b8a1d8cd83004a3b006d6065d",
+      "experiment/analyze.py": "a125c426f41fc17d59150f4c3cfd6741ef6c6674953f448fc3d4eab28216d714",
+      "experiment/sanity.py": "5a1072835e3377fc8cf60f0d20b479b3419913895a71552f7c71ea975b0f487c",
+      "experiment/preflight.py": "8cb773a8003b00e07fc6b1a426234e1d82f492a166439d28ebc1d33f259ebc69",
+      "experiment/lock_protocol.py": "68ad02ef882b700f11d4670183da68a798bbb3aeb98f551a837f5e10881afc96",
+      "experiment/contract.py": "da32497f797a8160bcc65794f800516e79fa5c2e8012b972401b581f9800ae64",
+      "experiment/smoke.py": "61378f93199587346934ade9d1484cabb410817e5b2013e5441f4fe2654a2251",
+      "experiment/run_comparison.sh": "4c5a1dd774935e0816116a599cd601a265decbc4a1ef4b2ebe6a444a013293b1",
+      "experiment/vertical_test.sh": "23adef5db78b4f26b9bb87a8d98afd9d578c9a5bb60d9619e35eaacc76748269",
+      "experiment/config.json": "a7b2adfc685a40479ec645733f868cb7112b8e35c13d8ee7c57b3228206de9d8"
+    },
+    "cache": "dcdb7f63c07c3679a8ba527d14910b67147aadeb9dd0da4a73be354990598c5a",
+    "cache_meta": {
+      "schema_version": 2,
+      "mode": "shared",
+      "source": "gaussian",
+      "seed": 0,
+      "student": "runs-local/warm.pt",
+      "splits": {
+        "train": 12,
+        "validation": 12
+      },
+      "contexts": 48,
+      "wall_s": 45.3
+    },
+    "epsilon": 0.01,
+    "metric_mode": "exact"
+  },
+  "license_note": "privileged simulator supervision for a diagnostic",
+  "metric_mode": "exact",
+  "n_contexts": 48,
+  "sampled_rows": [
+    33,
+    45,
+    24,
+    36,
+    31,
+    43,
+    25,
+    37,
+    29,
+    41,
+    35,
+    47,
+    28,
+    40,
+    27,
+    39
+  ],
+  "sampled_scenes": [
+    30000,
+    30001,
+    30002,
+    30003,
+    30004,
+    30005,
+    30006,
+    30007
+  ],
+  "protocol_id": null,
+  "source_hashes": {
+    "experiment/core.py": "0bb6dadaaffe6f3ccfae4c1a0d4f61f7b72e5349960207628473181955465638",
+    "experiment/hri_adapter.py": "f7844af7ff6c6b49b2dda90b2789d4b494a394476eb5e7dcf5e81f86e6e8d6d1",
+    "experiment/pilot.py": "aa01f4ecb44aa1254a84648060f9d1d6ee8fd4f7d29ebee98e73689813ba07cc",
+    "experiment/diagnose.py": "5a5745ea55e42b33f412fe2d4ff4b8bb2d9fbc1b8a1d8cd83004a3b006d6065d",
+    "experiment/analyze.py": "a125c426f41fc17d59150f4c3cfd6741ef6c6674953f448fc3d4eab28216d714",
+    "experiment/sanity.py": "5a1072835e3377fc8cf60f0d20b479b3419913895a71552f7c71ea975b0f487c",
+    "experiment/preflight.py": "8cb773a8003b00e07fc6b1a426234e1d82f492a166439d28ebc1d33f259ebc69",
+    "experiment/lock_protocol.py": "68ad02ef882b700f11d4670183da68a798bbb3aeb98f551a837f5e10881afc96",
+    "experiment/contract.py": "da32497f797a8160bcc65794f800516e79fa5c2e8012b972401b581f9800ae64",
+    "experiment/smoke.py": "61378f93199587346934ade9d1484cabb410817e5b2013e5441f4fe2654a2251",
+    "experiment/run_comparison.sh": "4c5a1dd774935e0816116a599cd601a265decbc4a1ef4b2ebe6a444a013293b1",
+    "experiment/vertical_test.sh": "23adef5db78b4f26b9bb87a8d98afd9d578c9a5bb60d9619e35eaacc76748269",
+    "experiment/config.json": "a7b2adfc685a40479ec645733f868cb7112b8e35c13d8ee7c57b3228206de9d8"
+  },
+  "student": "warm.pt",
+  "simulated": true,
+  "actual_error_distribution": {
+    "mid": {
+      "rms": 0.4304051101207733,
+      "median_norm": 2.441318988800049,
+      "p95_norm": 2.7764859199523926,
+      "n": 16
+    },
+    "end": {
+      "rms": 0.5865646004676819,
+      "median_norm": 3.286100149154663,
+      "p95_norm": 3.806771993637085,
+      "n": 16
+    },
+    "endpoint": {
+      "rms": 0.9226535558700562,
+      "median_norm": 5.279033660888672,
+      "p95_norm": 5.906650543212891,
+      "n": 16
+    }
+  },
+  "actual_errors_used_for_physical_tests": true,
+  "association": {
+    "exact_pullback->early_physical_squared": {
+      "actual_end_error": {
+        "rho": 0.5008829436138068,
+        "p": 0.048121068145965666,
+        "n": 16
+      },
+      "actual_endpoint_error": {
+        "rho": 0.30188190751375343,
+        "p": 0.2558140972531257,
+        "n": 16
+      },
+      "actual_mid_error": {
+        "rho": 0.5325598297475589,
+        "p": 0.033686539920182175,
+        "n": 16
+      },
+      "least_consequential": {
+        "rho": 0.8998944640529212,
+        "p": 2.065694145039069e-06,
+        "n": 16
+      },
+      "most_consequential": {
+        "rho": 0.871130714060362,
+        "p": 1.1182511502695943e-05,
+        "n": 16
+      },
+      "random@0.005": {
+        "rho": 0.8771106304632249,
+        "p": 5.971601804678867e-42,
+        "n": 128
+      },
+      "random@0.010": {
+        "rho": 0.8964847530831235,
+        "p": 2.25739190606437e-46,
+        "n": 128
+      },
+      "random@0.020": {
+        "rho": 0.8524493790737862,
+        "p": 2.693165025037151e-37,
+        "n": 128
+      }
+    },
+    "identity_prefix->early_physical_squared": {
+      "actual_end_error": {
+        "rho": 0.5676673360956476,
+        "p": 0.021808827918932277,
+        "n": 16
+      },
+      "actual_endpoint_error": {
+        "rho": 0.35333905083996137,
+        "p": 0.17943394794768508,
+        "n": 16
+      },
+      "actual_mid_error": {
+        "rho": 0.5995953327927062,
+        "p": 0.014088859895078845,
+        "n": 16
+      },
+      "least_consequential": {
+        "rho": 0.895785356911127,
+        "p": 2.7069254000734743e-06,
+        "n": 16
+      },
+      "most_consequential": {
+        "rho": 0.8834580354857445,
+        "p": 5.723325253042177e-06,
+        "n": 16
+      },
+      "random@0.005": {
+        "rho": 0.8399965886612858,
+        "p": 2.9432382952402755e-35,
+        "n": 128
+      },
+      "random@0.010": {
+        "rho": 0.88192111656339,
+        "p": 5.639484363352442e-43,
+        "n": 128
+      },
+      "random@0.020": {
+        "rho": 0.8755765620399416,
+        "p": 1.2413743091598242e-41,
+        "n": 128
+      }
+    },
+    "late_predicted->late_physical_squared": {
+      "actual_end_error": {
+        "rho": 0.6826647681276925,
+        "p": 0.0035667231393645047,
+        "n": 16
+      }
+    },
+    "endpoint_predicted->endpoint_physical_squared": {
+      "actual_endpoint_error": {
+        "rho": 0.1268280329788439,
+        "p": 0.6397431160507986,
+        "n": 16
+      }
+    }
+  },
+  "association_note": "within-radius rank association; whole-chunk MSE is constant on a sphere so its association is undefined and is never reported as zero",
+  "sketch_audit": {
+    "33": {
+      "exact_quadratic": 0.0,
+      "exact_trace": 0.0,
+      "1": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      },
+      "2": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      },
+      "4": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      },
+      "8": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      }
+    },
+    "45": {
+      "exact_quadratic": 0.0,
+      "exact_trace": 0.0,
+      "1": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      },
+      "2": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      },
+      "4": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      },
+      "8": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      }
+    },
+    "24": {
+      "exact_quadratic": 0.0,
+      "exact_trace": 0.0,
+      "1": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      },
+      "2": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      },
+      "4": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      },
+      "8": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      }
+    },
+    "36": {
+      "exact_quadratic": 0.014207068830728531,
+      "exact_trace": 0.044738054275512695,
+      "1": {
+        "quadratic_ratio": 0.03760580984618273,
+        "trace_ratio": 0.6167077460097524,
+        "matches_exact": false
+      },
+      "2": {
+        "quadratic_ratio": 0.4809334472390323,
+        "trace_ratio": 0.2591446364811213,
+        "matches_exact": false
+      },
+      "4": {
+        "quadratic_ratio": 0.9541245715097828,
+        "trace_ratio": 0.37910324349169977,
+        "matches_exact": false
+      },
+      "8": {
+        "quadratic_ratio": 2.0020377949807546,
+        "trace_ratio": 0.5992350498947481,
+        "matches_exact": false
+      }
+    },
+    "31": {
+      "exact_quadratic": 0.0,
+      "exact_trace": 0.0,
+      "1": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      },
+      "2": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      },
+      "4": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      },
+      "8": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      }
+    },
+    "43": {
+      "exact_quadratic": 0.0,
+      "exact_trace": 0.0,
+      "1": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      },
+      "2": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      },
+      "4": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      },
+      "8": {
+        "quadratic_ratio": null,
+        "trace_ratio": null,
+        "matches_exact": false
+      }
+    },
+    "25": {
+      "exact_quadratic": 0.03557385876774788,
+      "exact_trace": 0.02041069231927395,
+      "1": {
+        "quadratic_ratio": 1.146986083251259,
+        "trace_ratio": 1.0188064198756204,
+        "matches_exact": false
+      },
+      "2": {
+        "quadratic_ratio": 0.01103028345185006,
+        "trace_ratio": 0.02568890722014706,
+        "matches_exact": false
+      },
+      "4": {
+        "quadratic_ratio": 1.4948543267899115,
+        "trace_ratio": 1.5093240889888917,
+        "matches_exact": false
+      },
+      "8": {
+        "quadratic_ratio": 0.7518634117632891,
+        "trace_ratio": 0.7233924325147129,
+        "matches_exact": false
+      }
+    },
+    "37": {
+      "exact_quadratic": 0.006907693110406399,
+      "exact_trace": 0.005129700526595116,
+      "1": {
+        "quadratic_ratio": 1.9944718129603312,
+        "trace_ratio": 2.185735081538148,
+        "matches_exact": false
+      },
+      "2": {
+        "quadratic_ratio": 1.1945210506723738,
+        "trace_ratio": 1.1181496136328892,
+        "matches_exact": false
+      },
+      "4": {
+        "quadratic_ratio": 1.3824436816703718,
+        "trace_ratio": 1.537361105916622,
+        "matches_exact": false
+      },
+      "8": {
+        "quadratic_ratio": 0.9583956163875293,
+        "trace_ratio": 0.738152948797507,
+        "matches_exact": false
+      }
+    }
+  },
+  "epsilon_stability": {
+    "33": {
+      "max_abs_change": 0.0,
+      "relative_change": 0.0,
+      "epsilon": 0.01
+    },
+    "45": {
+      "max_abs_change": 0.0,
+      "relative_change": 0.0,
+      "epsilon": 0.01
+    },
+    "24": {
+      "max_abs_change": 0.0,
+      "relative_change": 0.0,
+      "epsilon": 0.01
+    }
+  },
+  "predictions_path": "runs-local/geometry_predictions.npz",
+  "schema_version": 2
+}

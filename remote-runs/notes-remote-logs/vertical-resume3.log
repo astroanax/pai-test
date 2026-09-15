@@ -1,0 +1,20 @@
+[resume] skip train uniform/0
+[resume] skip eval uniform/0
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+Traceback (most recent call last):
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/pilot.py", line 685, in <module>
+    raise SystemExit(main())
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/pilot.py", line 669, in main
+    cmd_train(args, config, device)
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/pilot.py", line 358, in cmd_train
+    protocol, protocol_id = protocol_for(args, config)
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/pilot.py", line 81, in protocol_for
+    C.verify_current_protocol(protocol, config, args.config,
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/contract.py", line 703, in verify_current_protocol
+    raise ProtocolError("protocol lock is stale for stage " + stage + ": " +
+contract.ProtocolError: protocol lock is stale for stage train: experiment sources changed ([('experiment/core.py', '0bb6dadaaffe6f3ccfae4c1a0d4f61f7b72e5349960207628473181955465638'), ('experiment/core.py', '5749b1f2238ee32dedafa734bf9a5e8abd665f4466d85446237172a253375955'), ('experiment/pilot.py', '7b0b53e54348308925f4937f729f0fbc769c33199f3ee89539f5d6c84e41220b')])
+[resume] FAIL: train pullback/0
+RESUME_EXIT=1

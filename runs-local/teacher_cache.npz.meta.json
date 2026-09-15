@@ -1,0 +1,101 @@
+{
+  "schema_version": 2,
+  "mode": "teacher",
+  "source": "gaussian",
+  "seed": 0,
+  "student": null,
+  "splits": {
+    "train": 12,
+    "validation": 12
+  },
+  "contexts": 48,
+  "wall_s": 46.0,
+  "fingerprint": {
+    "source": "gaussian",
+    "teacher_steps": 16,
+    "execute_steps": 8,
+    "episode_steps": 300,
+    "contexts_per_episode": 16,
+    "finite_difference_epsilon": 0.01,
+    "legacy": false,
+    "clip_actions": false,
+    "train_scene_start": 20000,
+    "train_episodes": 112,
+    "validation_scene_start": 30000,
+    "validation_episodes": 16,
+    "development_scene_start": 10000,
+    "development_episodes": 20,
+    "test_scene_start": 40000,
+    "test_episodes": 100,
+    "repository": "external/flow_matching",
+    "metric_mode": "exact",
+    "num_probes": 4,
+    "schema_version": 2,
+    "upstream": {
+      "external/flow_matching/external/models/unet.py": "fa734a97ebc3a5d998b661005b9e27a31138eb306b9bf9d75f14bc5e88fbb482",
+      "external/flow_matching/external/models/resnet.py": "46db6fb7187df0d996031ff70bbd071b8eb4dc4b875f9fed27fbfd48c906494b",
+      "external/flow_matching/external/models/pusht.py": "4b3f552b319a5554e0c8f813d052a20eb71a68a954db83f50961abc8667f562c"
+    },
+    "upstream_commit": "516e8e18875b27741bdbdb8a252e904032c90723",
+    "assets": {
+      "checkpoint": "a4e16aebb2bcddc32846109dd7bd61a88d9f31bd0791357e76268958b5bd1096",
+      "normalizer": "a222fa68088ee1286f5611afd56eaada387e9011181e598dd01a2742c1b769b7"
+    },
+    "teacher_checkpoint": "a4e16aebb2bcddc32846109dd7bd61a88d9f31bd0791357e76268958b5bd1096",
+    "normalizer": "a222fa68088ee1286f5611afd56eaada387e9011181e598dd01a2742c1b769b7",
+    "feature_version": 1,
+    "has_labels": true,
+    "has_metrics": false
+  },
+  "lineage": {
+    "source_hashes": {
+      "experiment/core.py": "0bb6dadaaffe6f3ccfae4c1a0d4f61f7b72e5349960207628473181955465638",
+      "experiment/hri_adapter.py": "f7844af7ff6c6b49b2dda90b2789d4b494a394476eb5e7dcf5e81f86e6e8d6d1",
+      "experiment/pilot.py": "aa01f4ecb44aa1254a84648060f9d1d6ee8fd4f7d29ebee98e73689813ba07cc",
+      "experiment/diagnose.py": "5a5745ea55e42b33f412fe2d4ff4b8bb2d9fbc1b8a1d8cd83004a3b006d6065d",
+      "experiment/analyze.py": "a125c426f41fc17d59150f4c3cfd6741ef6c6674953f448fc3d4eab28216d714",
+      "experiment/sanity.py": "5a1072835e3377fc8cf60f0d20b479b3419913895a71552f7c71ea975b0f487c",
+      "experiment/preflight.py": "8cb773a8003b00e07fc6b1a426234e1d82f492a166439d28ebc1d33f259ebc69",
+      "experiment/lock_protocol.py": "68ad02ef882b700f11d4670183da68a798bbb3aeb98f551a837f5e10881afc96",
+      "experiment/contract.py": "da32497f797a8160bcc65794f800516e79fa5c2e8012b972401b581f9800ae64",
+      "experiment/smoke.py": "61378f93199587346934ade9d1484cabb410817e5b2013e5441f4fe2654a2251",
+      "experiment/run_comparison.sh": "4c5a1dd774935e0816116a599cd601a265decbc4a1ef4b2ebe6a444a013293b1",
+      "experiment/vertical_test.sh": "23adef5db78b4f26b9bb87a8d98afd9d578c9a5bb60d9619e35eaacc76748269",
+      "experiment/config.json": "a7b2adfc685a40479ec645733f868cb7112b8e35c13d8ee7c57b3228206de9d8"
+    },
+    "checkpoint_sha256": null,
+    "normalizer_sha256": "a222fa68088ee1286f5611afd56eaada387e9011181e598dd01a2742c1b769b7",
+    "mode": "teacher",
+    "source": "gaussian",
+    "split_scenes": {
+      "train": [
+        20000,
+        20001,
+        20002,
+        20003,
+        20004,
+        20005,
+        20006,
+        20007,
+        20008,
+        20009,
+        20010,
+        20011
+      ],
+      "validation": [
+        30000,
+        30001,
+        30002,
+        30003,
+        30004,
+        30005,
+        30006,
+        30007,
+        30008,
+        30009,
+        30010,
+        30011
+      ]
+    }
+  }
+}

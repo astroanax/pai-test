@@ -1,0 +1,6 @@
+usage: pilot.py train [-h] --cache CACHE --output OUTPUT --mode
+                      {uniform,prefix,endpoint,pullback,identity,scalar}
+                      [--seed SEED] [--updates UPDATES] [--initial INITIAL]
+pilot.py train: error: argument --mode: invalid choice: '' (choose from 'uniform', 'prefix', 'endpoint', 'pullback', 'identity', 'scalar')
+[resume] FAIL: train /
+RESUME_EXIT=1

@@ -1,0 +1,22 @@
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+locked protocol runs-vertical/protocol_locked.json id 9effb257dea54641372679923bc1468b
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[train] mode uniform: label-only path, no Jacobians, no transported metric, no scale estimation
+wrote student runs-vertical/student_uniform_seed0.pt mode uniform
+Traceback (most recent call last):
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/pilot.py", line 685, in <module>
+    raise SystemExit(main())
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/pilot.py", line 660, in main
+    C.reserve_outputs([output, meta_path])
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/contract.py", line 383, in reserve_outputs
+    raise ValueError("output already exists or is reserved, refusing to "
+ValueError: output already exists or is reserved, refusing to overwrite: runs-vertical/final_uniform_seed0.meta.json, runs-vertical/final_uniform_seed0.meta.json.reserved
+[resume] FAIL: evaluate uniform/0
+[relock] FAIL: resume
+RELOCK_EXIT=1

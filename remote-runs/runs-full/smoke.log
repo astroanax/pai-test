@@ -1,0 +1,20 @@
+[smoke] compute: {"cudnn_disabled": true, "flag": "EXECPB_DISABLE_CUDNN"}
+[smoke] cudnn: {"healthy": false, "error": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nRuntimeError: cuDNN error: CUDNN_STATUS_NOT_INITIALIZED\n", "recommendation": "set EXECPB_DISABLE_CUDNN=1 to run the experiment with cuDNN disabled"}
+[smoke] sources: {"dir": "/home/b231090pe/rehan/execution-pullback-test/experiment", "source": "no_git", "missing": [], "tracked": [], "untracked": ["core.py", "hri_adapter.py", "pilot.py", "diagnose.py", "analyze.py", "sanity.py", "preflight.py", "lock_protocol.py", "contract.py", "smoke.py", "run_comparison.sh", "vertical_test.sh", "config.json"], "ignored": [], "complete": true, "delivery_risk": ["core.py", "hri_adapter.py", "pilot.py", "diagnose.py", "analyze.py", "sanity.py", "preflight.py", "lock_protocol.py", "contract.py", "smoke.py", "run_comparison.sh", "vertical_test.sh", "config.json"], "note": "no git repository here; ship the explicit manifest and verify it after transfer"}
+[smoke] device: cuda
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[smoke] adapter_strict_load: ok
+[smoke] device_placement: ok
+[smoke] env_reset_and_step: ok
+[smoke] teacher_half_map_consistency: ok
+[smoke] teacher_suffix_directional_derivative: ok
+[smoke] teacher_batch_independence: ok
+[smoke] exact_pullback_metric: ok
+[smoke] replay_and_image_state_transitions: ok
+[smoke] tiny_train_step_all_modes: ok
+[smoke] uniform_train_without_metrics: ok
+[smoke] source_conventions: ok
+[smoke] PASS -> runs-full/smoke_report.json

@@ -42,15 +42,26 @@ def load_checkpoint(path, device):
     return vision_encoder, noise_pred_net
 
 
+def _device_key(device):
+    device = torch.device(device)
+    if device.type == "cuda":
+        return ("cuda", device.index if device.index is not None else 0)
+    return (device.type, device.index)
+
+
 def check_devices(vision_encoder, noise_pred_net, condition, actions, device):
-    """Every tensor that participates in the forward pass must live on `device`."""
-    expected = torch.device(device)
-    devices = {str(next(vision_encoder.parameters()).device),
-               str(next(noise_pred_net.parameters()).device),
-               str(condition.device), str(actions.device)}
-    if devices != {str(expected)}:
-        raise ValueError(f"device mismatch: {sorted(devices)} vs {expected}")
-    return sorted(devices)
+    """Every tensor that participates in the forward pass must live on `device`.
+
+    CUDA indices are normalized, so "cuda" and "cuda:0" compare equal instead of
+    falsely failing.
+    """
+    expected = _device_key(device)
+    actual = {_device_key(next(vision_encoder.parameters()).device),
+              _device_key(next(noise_pred_net.parameters()).device),
+              _device_key(condition.device), _device_key(actions.device)}
+    if actual != {expected}:
+        raise ValueError(f"device mismatch: {sorted(actual)} vs {expected}")
+    return sorted(actual)
 
 
 def encode_condition(vision_encoder, image, agent_pos):
@@ -169,9 +180,10 @@ class HRIAdapter:
         self.device = torch.device(device)
         self.legacy = legacy
         self.clip_actions = clip_actions
-        for module in (vision_encoder, noise_pred_net):
-            if next(module.parameters()).device != self.device:
-                raise ValueError("module device does not match adapter device")
+        for name, module in (("vision_encoder", vision_encoder),
+                             ("noise_pred_net", noise_pred_net)):
+            if _device_key(next(module.parameters()).device) != _device_key(self.device):
+                raise ValueError(f"{name} device does not match adapter device")
 
     def new_env(self, image):
         import pusht

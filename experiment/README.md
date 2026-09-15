@@ -28,12 +28,15 @@ Run order (schema v2 artifacts are incompatible with v1; rebuild them)
        --write-manifest experiment/MANIFEST.json
 2  python experiment/pilot.py --config experiment/config.json \
        normalizer --dataset <zarr path> --output assets/normalizer.npz
+   (global flags such as --config, --device, --protocol, and --allow-unlocked
+   must precede the subcommand; argparse rejects them after it)
 3  python experiment/sanity.py --require-torch
 4  python experiment/smoke.py --config experiment/config.json \
        --output runs/smoke_report.json
 5  teacher cache:     pilot.py collect --output runs/teacher_cache.npz
-   warm student:      pilot.py train --cache runs/teacher_cache.npz \
-                          --mode uniform --output runs/warm.pt --allow-unlocked
+   warm student:      pilot.py --config experiment/config.json --allow-unlocked \
+                          train --cache runs/teacher_cache.npz \
+                          --mode uniform --output runs/warm.pt
 6  shared cache:      pilot.py collect --student runs/warm.pt \
                           --output runs/shared_cache.npz
 7  metric profile:    pilot.py metrics --cache runs/shared_cache.npz --limit 8 \
@@ -104,6 +107,33 @@ plus tie-aware Spearman with an explicit constant-input note, preflight honourin
    binary success validation, torch seeding tied to the training seed, and a
    transfer manifest
 
+Vertical test (run this first on the GPU machine, before the A100 budget)
+- bash experiment/vertical_test.sh [run_dir]: two training scenes plus two
+  validation scenes through every real producer/consumer command, including the
+  lock, brief training, two-seed evaluation, analysis, and a negative control
+  that must reject a deliberately incomplete experiment.
+
+Fixes applied against the fourth audit
+- smoke envs() keeps the reset observation instead of discarding it; the
+  exact-metric shape is derived from the live tensors, never hard-coded
+- device comparison normalizes cuda indices, so "cuda" and "cuda:0" match
+- warm training accepts the teacher cache; only metric modes require mode
+  "shared", which the metric writer now records
+- metric_count 0 falls back to the full batch instead of an empty NaN mean
+- the unlocked uniform warm start passes provenance; unlocked metric
+  checkpoints are still rejected
+- the metric subset is spread round-robin across scenes with a fixed seed
+- the marked pool is drawn identically for every mode, so all arms share the
+  same minibatch streams
+- the diagnostic pairs each predictor only with its matching outcome, with
+  dedicated late and endpoint predictors
+- global flags must precede the subcommand; the README warm-start line is fixed
+- missing locked artifacts now fail verification, and final evaluation always
+  requires the lock (training needs it except for the unlocked warm start)
+- student collection computes teacher targets only for stored decisions
+- lock_protocol accepts --min-metric-fraction, --final-prefix, and
+  --test-episodes so the vertical test can lock a tiny predeclared run
+
 Not run here: no GPU, no torch, no simulator, and no upstream checkout are
-present in this workspace, so nothing is executed end to end. Run steps 1 to 10
-on the GPU machine before locking the protocol.
+present in this workspace, so nothing is executed end to end. Run the vertical
+test on the GPU machine before locking the main protocol.

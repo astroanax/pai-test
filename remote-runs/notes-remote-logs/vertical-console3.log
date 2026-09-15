@@ -1,0 +1,95 @@
+[vertical] run dir: runs-vertical
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+sanity {"metric_subset_spread": {"scenes": [20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007], "n": 16}, "warm_provenance": {"warm_start_accepted": true, "unlocked_metric_rejected": true}, "linear_algebra": {"finite_difference_gap": 1.5215562143566785e-10, "quadratic": 0.17000000000000004, "trace": 7.25}, "config_validation": ["teacher_steps=0: invalid configuration test: teacher_steps must b", "teacher_steps=15: invalid configuration test: teacher_steps must b", "execute_steps=0: invalid configuration test: execute_steps must b", "execute_steps=17: invalid configuration test: execute_steps must s", "episode_steps=-1: invalid configuration test: episode_steps must b", "num_probes=0: invalid configuration test: num_probes must be a", "batch_size=127: invalid configuration test: batch_size must be e", "finite_difference_epsilon=0.0: invalid configuration test: finite_difference_ep", "learning_rate=0.0: invalid configuration test: learning_rate must b", "metric_weight=-1: invalid configuration test: metric_weight must b", "validation_metric_contexts=0: invalid configuration test: validation_metric_co", "native_fast_steps=0: invalid configuration test: native_fast_steps mu", "source=gauss: invalid configuration test: source must be gauss", "metric_mode=approx: invalid configuration test: metric_mode must be ", "validation_scene_start overlap rejected", "test_scene_start overlap rejected"], "spearman_ties": {"tie_aware": 0.6666666666666666, "double_argsort": 0.7, "constant_reported_as_nan": true}, "manifest": {"files": 13, "verified": 13, "delivery_risk": ["core.py", "hri_adapter.py", "pilot.py", "diagnose.py"]}, "producer_consumer": {"label_cache_contexts": 6, "splits": {"train": 4, "validation": 2}, "metric_required_rejected": true, "subset": {"train": 4, "validation": 2}, "label_context_keys": ["condition", "midpoint", "noise", "target_end", "target_mid", "teacher_end"], "metric_cache_contexts": 4, "contract_drift_rejected": true, "metric_mode_change_rejected": true}, "reserve_and_completion": {"reserved": true, "completed": true, "incomplete_after_failure": true}, "protocol_and_analysis": {"fresh_lock_verified": true, "missing_artifact_rejected": true, "stale_source_rejected": true, "config_drift_rejected": true, "complete_ok": true, "joint_missing_pair_rejected": true, "non_binary_success_rejected": true, "two_seeds_accepted": [["endpoint", 0], ["endpoint", 1], ["pullback", 0], ["pullback", 1]], "duplicate_run_rejected": true}, "empty_metric_count": {"empty_count_falls_back_to_full_batch": true}, "device_keys": {"cuda_equals_cuda0": true}, "torch_checks": {"linear_composition_max_gap": 0.0, "quadratic_matches_manual": 0.3963330388069153, "exact_trace_matches": true, "sketch_shape": [1, 4, 32], "sketch_trace_ratio": 0.9311273693622228, "prefix_error_rejected": true, "prefix_selection": {"marked_only": 0.0, "all_examples": 5000.0}, "uniform_without_metrics_ok": 0.0, "pullback_without_metric_rejected": true, "nonfinite_gradient_rejected": true}}
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[smoke] compute: {"cudnn_disabled": true, "flag": "EXECPB_DISABLE_CUDNN"}
+[smoke] cudnn: {"healthy": false, "error": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nRuntimeError: cuDNN error: CUDNN_STATUS_NOT_INITIALIZED\n", "recommendation": "set EXECPB_DISABLE_CUDNN=1 to run the experiment with cuDNN disabled"}
+[smoke] sources: {"dir": "/home/b231090pe/rehan/execution-pullback-test/experiment", "source": "no_git", "missing": [], "tracked": [], "untracked": ["core.py", "hri_adapter.py", "pilot.py", "diagnose.py", "analyze.py", "sanity.py", "preflight.py", "lock_protocol.py", "contract.py", "smoke.py", "run_comparison.sh", "vertical_test.sh", "config.json"], "ignored": [], "complete": true, "delivery_risk": ["core.py", "hri_adapter.py", "pilot.py", "diagnose.py", "analyze.py", "sanity.py", "preflight.py", "lock_protocol.py", "contract.py", "smoke.py", "run_comparison.sh", "vertical_test.sh", "config.json"], "note": "no git repository here; ship the explicit manifest and verify it after transfer"}
+[smoke] device: cuda
+[smoke] adapter_strict_load: ok
+[smoke] device_placement: ok
+[smoke] env_reset_and_step: ok
+[smoke] teacher_half_map_consistency: ok
+[smoke] teacher_suffix_directional_derivative: ok
+[smoke] teacher_batch_independence: ok
+[smoke] exact_pullback_metric: ok
+[smoke] replay_and_image_state_transitions: ok
+[smoke] tiny_train_step_all_modes: ok
+[smoke] uniform_train_without_metrics: ok
+[smoke] source_conventions: ok
+[smoke] PASS -> runs-vertical/smoke_report.json
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+wrote cache runs-vertical/teacher_cache.npz contexts 8 splits {'train': 2, 'validation': 2}
+[train] mode uniform: label-only path, no Jacobians, no transported metric, no scale estimation
+wrote student runs-vertical/warm.pt mode uniform
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+wrote cache runs-vertical/shared_cache.npz contexts 8 splits {'train': 2, 'validation': 2}
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[metrics] selected 4 train + 0 validation contexts of 8 (metric_mode=exact); one repeated-branch determinism check per context
+[metrics] first context took 1.19s; projected 0.1 min for 4 contexts
+wrote metrics runs-vertical/profile_metrics.npz contexts 4
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[metrics] selected 4 train + 4 validation contexts of 8 (metric_mode=exact); one repeated-branch determinism check per context
+[metrics] first context took 1.45s; projected 0.2 min for 8 contexts
+wrote metrics runs-vertical/shared_metrics.npz contexts 8
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+wrote diagnostic runs-vertical/geometry.json
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+locked protocol runs-vertical/protocol_locked.json id de1f743fd1ef96ba5af06098fccd3a1f
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[train] mode uniform: label-only path, no Jacobians, no transported metric, no scale estimation
+wrote student runs-vertical/student_uniform_seed0.pt mode uniform
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[eval] device=cuda source=gaussian steps=16 split=test episodes=2 intrinsic_mode=uniform warmup_episodes=1 clip=False
+wrote eval runs-vertical/final_uniform_seed0.jsonl
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+Traceback (most recent call last):
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/pilot.py", line 678, in <module>
+    raise SystemExit(main())
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/pilot.py", line 664, in main
+    cmd_train(args, config, device)
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/pilot.py", line 382, in cmd_train
+    scales, scale_stats = metric_scales(
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/core.py", line 329, in metric_scales
+    scales = {"endpoint": positive_median(first),
+  File "/home/b231090pe/rehan/execution-pullback-test/experiment/core.py", line 324, in positive_median
+    raise ValueError(
+ValueError: too few nonzero sensitivity labels (need >= 8 positive traces); stop the metric experiment and inspect the cache
+[vertical] FAIL: train pullback/0

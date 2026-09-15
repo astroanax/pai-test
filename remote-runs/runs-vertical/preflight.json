@@ -1,0 +1,122 @@
+{
+  "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]",
+  "modules": {
+    "torch": "2.6.0+cu124",
+    "torchvision": "0.21.0+cu124",
+    "numpy": "2.2.6",
+    "scipy": "1.15.3",
+    "pandas": "2.3.1",
+    "gym": "0.26.2",
+    "pygame": "2.6.1",
+    "pymunk": "present",
+    "shapely": "2.1.2",
+    "cv2": "4.12.0",
+    "skimage": "0.25.2",
+    "zarr": "2.18.3",
+    "diffusers": "0.40.0",
+    "imageio_ffmpeg": "0.6.0"
+  },
+  "cuda": {
+    "available": true,
+    "devices": 1,
+    "torch": "2.6.0+cu124"
+  },
+  "assets": {
+    "assets/flow_pusht.pth": true,
+    "assets/normalizer.npz": true,
+    "external/flow_matching": true
+  },
+  "manifest": {
+    "dir": "/home/b231090pe/rehan/execution-pullback-test/experiment",
+    "source": "no_git",
+    "missing": [],
+    "tracked": [],
+    "untracked": [
+      "core.py",
+      "hri_adapter.py",
+      "pilot.py",
+      "diagnose.py",
+      "analyze.py",
+      "sanity.py",
+      "preflight.py",
+      "lock_protocol.py",
+      "contract.py",
+      "smoke.py",
+      "run_comparison.sh",
+      "vertical_test.sh",
+      "config.json"
+    ],
+    "ignored": [],
+    "complete": true,
+    "delivery_risk": [
+      "core.py",
+      "hri_adapter.py",
+      "pilot.py",
+      "diagnose.py",
+      "analyze.py",
+      "sanity.py",
+      "preflight.py",
+      "lock_protocol.py",
+      "contract.py",
+      "smoke.py",
+      "run_comparison.sh",
+      "vertical_test.sh",
+      "config.json"
+    ],
+    "note": "no git repository here; ship the explicit manifest and verify it after transfer"
+  },
+  "source_hashes": {
+    "experiment/core.py": "5749b1f2238ee32dedafa734bf9a5e8abd665f4466d85446237172a253375955",
+    "experiment/hri_adapter.py": "f7844af7ff6c6b49b2dda90b2789d4b494a394476eb5e7dcf5e81f86e6e8d6d1",
+    "experiment/pilot.py": "a64f985c25d9b9364ea0230e79d4e6e6444dfc4e269c7431f990942e549cf5b9",
+    "experiment/diagnose.py": "5a5745ea55e42b33f412fe2d4ff4b8bb2d9fbc1b8a1d8cd83004a3b006d6065d",
+    "experiment/analyze.py": "a125c426f41fc17d59150f4c3cfd6741ef6c6674953f448fc3d4eab28216d714",
+    "experiment/sanity.py": "5a1072835e3377fc8cf60f0d20b479b3419913895a71552f7c71ea975b0f487c",
+    "experiment/preflight.py": "8cb773a8003b00e07fc6b1a426234e1d82f492a166439d28ebc1d33f259ebc69",
+    "experiment/lock_protocol.py": "68ad02ef882b700f11d4670183da68a798bbb3aeb98f551a837f5e10881afc96",
+    "experiment/contract.py": "da32497f797a8160bcc65794f800516e79fa5c2e8012b972401b581f9800ae64",
+    "experiment/smoke.py": "803e3b8c7bf7a536fbac351a7462fc795d3b7cddc7acb97e3a4b28b3334aaa68",
+    "experiment/run_comparison.sh": "4c5a1dd774935e0816116a599cd601a265decbc4a1ef4b2ebe6a444a013293b1",
+    "experiment/vertical_test.sh": "23adef5db78b4f26b9bb87a8d98afd9d578c9a5bb60d9619e35eaacc76748269",
+    "experiment/config.json": "a7b2adfc685a40479ec645733f868cb7112b8e35c13d8ee7c57b3228206de9d8"
+  },
+  "schema_version": 2,
+  "config_path": "experiment/config.json",
+  "config_valid": true,
+  "split_ranges": {
+    "train": [
+      20000,
+      20111
+    ],
+    "validation": [
+      30000,
+      30015
+    ],
+    "development": [
+      10000,
+      10019
+    ],
+    "test": [
+      40000,
+      40099
+    ]
+  },
+  "upstream": {
+    "external/flow_matching/external/models/unet.py": "fa734a97ebc3a5d998b661005b9e27a31138eb306b9bf9d75f14bc5e88fbb482",
+    "external/flow_matching/external/models/resnet.py": "46db6fb7187df0d996031ff70bbd071b8eb4dc4b875f9fed27fbfd48c906494b",
+    "external/flow_matching/external/models/pusht.py": "4b3f552b319a5554e0c8f813d052a20eb71a68a954db83f50961abc8667f562c"
+  },
+  "upstream_commit": "516e8e18875b27741bdbdb8a252e904032c90723",
+  "requested_device": "cuda",
+  "cuda_ok": true,
+  "artifacts": {
+    "runs/smoke_report.json": {
+      "exists": true,
+      "complete": true
+    },
+    "runs/protocol_locked.json": {
+      "exists": false,
+      "complete": false
+    }
+  }
+}

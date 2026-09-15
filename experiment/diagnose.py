@@ -66,6 +66,7 @@ def main():
     parser.add_argument("--no-simulate", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
+    C.apply_compute_env(args.device or config["device"])
     device = resolve_device(args.device or config["device"])
     protocol = None
     if args.protocol:
@@ -206,6 +207,15 @@ def main():
                         pullback_quadratic(metric, error, sketch=True).item())
                 else:
                     row["sketch_pullback"] = None
+                # the late and endpoint outcomes have their own predictors: the
+                # late term consumes the end error through jacobian_end and the
+                # endpoint term consumes the whole-student error through
+                # jacobian_start. Comparing an early predictor against a late
+                # outcome would mismatch the trained penalty.
+                row["late_predicted"] = float(physical_error(
+                    jac_end, error, config["execute_steps"]).item())
+                row["endpoint_predicted"] = float(physical_error(
+                    jac_start, error, config["execute_steps"]).item())
                 if adapter is not None:
                     # EARLY: perturb the full teacher midpoint, run the suffix,
                     # execute its prefix. The direction is never added to the
@@ -245,19 +255,23 @@ def main():
                             np.sum((endpoint_features - base_exec["endpoint"]) ** 2))
                 records.append(row)
 
-    # predictor quality on the same contexts and directions
+    # predictor quality: each predictor is compared ONLY against its matching
+    # outcome, mirroring the trained penalty each one stands for
     report["association"] = {}
-    for predictor in ("exact_pullback", "identity_prefix", "sketch_pullback"):
-        for outcome in ("early_physical_squared", "late_physical_squared",
-                        "endpoint_physical_squared"):
-            for name in sorted({r["set"] for r in records}):
-                subset = [r for r in records if r["set"] == name]
-                preds = [r.get(predictor) for r in subset]
-                outs = [r.get(outcome) for r in subset]
-                if any(p is None for p in preds) or any(o is None for o in outs):
-                    continue
-                report["association"].setdefault(f"{predictor}->{outcome}", {})[name] = \
-                    _spearman(preds, outs)
+    pairs = [("exact_pullback", "early_physical_squared"),
+             ("identity_prefix", "early_physical_squared"),
+             ("sketch_pullback", "early_physical_squared"),
+             ("late_predicted", "late_physical_squared"),
+             ("endpoint_predicted", "endpoint_physical_squared")]
+    for predictor, outcome in pairs:
+        for name in sorted({r["set"] for r in records}):
+            subset = [r for r in records if r["set"] == name]
+            preds = [r.get(predictor) for r in subset]
+            outs = [r.get(outcome) for r in subset]
+            if any(p is None for p in preds) or any(o is None for o in outs):
+                continue
+            report["association"].setdefault(f"{predictor}->{outcome}", {})[name] = \
+                _spearman(preds, outs)
     report["association_note"] = ("within-radius rank association; whole-chunk MSE is "
                                  "constant on a sphere so its association is undefined "
                                  "and is never reported as zero")

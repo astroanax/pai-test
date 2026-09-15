@@ -20,6 +20,17 @@ def main():
     parser.add_argument("--warm", default="runs/warm.pt")
     parser.add_argument("--smoke-report", default="runs/smoke_report.json")
     parser.add_argument("--output", default="runs/protocol_locked.json")
+    parser.add_argument("--min-metric-fraction", type=float, default=0.5,
+                        help="minimum fraction of the planned metric subset that "
+                             "must be present; lower only for a tiny vertical test")
+    parser.add_argument("--final-prefix", default="runs/final_",
+                        help="directory prefix where final evaluations will land; "
+                             "the lock refuses if outcomes already exist there")
+    parser.add_argument("--test-episodes", type=int, default=None,
+                        help="predeclared final evaluation size; defaults to the "
+                             "configured test count (a smaller predeclared size "
+                             "weakens precision and must be chosen before seeing "
+                             "outcomes)")
     args = parser.parse_args()
 
     with open(args.config) as handle:
@@ -49,9 +60,11 @@ def main():
     verified = C.verify_label_cache(args.cache, config, expect_mode="shared",
                                     allowed_scenes=allowed, require_metric=True)
     train_rows, validation_rows = C.metric_subset(verified, config)
-    if len(train_rows) < int(config["metric_contexts"]) * 0.5:
+    required_rows = int(config["metric_contexts"]) * args.min_metric_fraction
+    if len(train_rows) < required_rows:
         raise ValueError(f"metric cache holds {len(train_rows)} training contexts, "
-                         f"far below the planned {config['metric_contexts']}")
+                         f"below {args.min_metric_fraction:.0%} of the planned "
+                         f"{config['metric_contexts']}")
     with open(args.smoke_report) as handle:
         smoke = json.load(handle)
     if not smoke.get("passed"):
@@ -68,6 +81,10 @@ def main():
     if splits["errors"]:
         raise ValueError("; ".join(splits["errors"]))
     final_scenes = sorted(C.scene_range(config, "test"))
+    if args.test_episodes is not None:
+        if args.test_episodes < 1 or args.test_episodes > len(final_scenes):
+            raise ValueError("--test-episodes must be within the configured range")
+        final_scenes = final_scenes[:args.test_episodes]
     C.validate_scene_sets({"train": sorted(C.scene_range(config, "train")),
                            "validation": sorted(C.scene_range(config, "validation")),
                            "development": sorted(C.scene_range(config, "development")),
@@ -76,7 +93,7 @@ def main():
         raise ValueError("protocol already locked: " + args.output)
     for mode in args.modes:
         for seed in args.seeds:
-            path = f"runs/final_{mode}_seed{seed}.jsonl"
+            path = f"{args.final_prefix}{mode}_seed{seed}.jsonl"
             if os.path.exists(path):
                 raise ValueError("final outcomes already exist: " + path)
 
@@ -93,7 +110,11 @@ def main():
         updates=int(args.updates), warm_start=args.warm,
         warm_start_sha256=C.sha256_file(args.warm),
         cache=args.cache, cache_sha256=C.sha256_file(args.cache),
-        primary_contrast=["pullback", "endpoint"],
+        primary_contrast=(["pullback", "endpoint"]
+                          if "endpoint" in args.modes and "pullback" in args.modes
+                          else (["pullback", "uniform"]
+                                if "pullback" in args.modes and "uniform" in args.modes
+                                else list(args.modes[:2]))),
         final_scenes=final_scenes,
         development_scenes=sorted(C.scene_range(config, "development")),
         train_scenes=sorted(C.scene_range(config, "train")),
@@ -115,6 +136,9 @@ def main():
         smoke_report=args.smoke_report,
         smoke_report_sha256=C.sha256_file(args.smoke_report),
         resolved_config=config,
+        min_metric_fraction=float(args.min_metric_fraction),
+        final_prefix=args.final_prefix,
+        test_episodes_planned=len(final_scenes),
         no_final_results_examined=True)
     C.write_meta(args.output, protocol)
     print("locked protocol " + args.output + " id " + protocol_id)

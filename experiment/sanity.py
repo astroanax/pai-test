@@ -174,6 +174,69 @@ def check_producer_consumer(config, tmpdir):
     return out
 
 
+def check_metric_subset_spread(config):
+    """The exact-metric subset must spread across scenes, not take the earliest."""
+    rng = __import__("numpy").random.default_rng(0)
+    contexts = []
+    for scene_offset in range(8):
+        scene = sorted(C.scene_range(config, "train"))[scene_offset]
+        for _ in range(10):
+            contexts.append(synthetic_context(scene, "train", rng))
+    verified = {"contexts": contexts}
+    train_rows, _ = C.metric_subset(verified, dict(config, metric_contexts=16,
+                                                   validation_metric_contexts=0))
+    scenes = sorted({int(r["scene"]) for r in train_rows})
+    assert len(train_rows) == 16, len(train_rows)
+    assert len(scenes) >= 6, f"subset concentrates in {scenes}"
+    earliest = sorted(C.scene_range(config, "train"))[0]
+    assert sum(1 for r in train_rows if int(r["scene"]) == earliest) <= 4,         "subset overweights the earliest scene"
+    return dict(scenes=scenes, n=len(train_rows))
+
+
+def check_empty_metric_count():
+    """metric_count=0 must fall back to the full batch, never NaN."""
+    import torch
+    from core import TwoStepStudent, objective
+    torch.manual_seed(0)
+    student = TwoStepStudent(condition_dim=8, horizon=16, action_dim=2, width=32)
+    batch = {k: torch.zeros(4, 16, 2) for k in
+             ("noise", "midpoint", "target_mid", "target_end", "teacher_end")}
+    batch["condition"] = torch.zeros(4, 8)
+    for count in (0, None):
+        loss, parts = objective(student, batch, "prefix", 8, None,
+                                metric_count=count)
+        assert torch.isfinite(loss), f"prefix with metric_count={count} is nonfinite"
+        assert torch.isfinite(parts["penalty"]), "prefix penalty is NaN"
+    return dict(empty_count_falls_back_to_full_batch=True)
+
+
+def check_warm_provenance_accepted(config):
+    """An unlocked uniform warm start must pass provenance for locked training."""
+    payload = dict(protocol_id=None, mode="uniform", seed=0, updates=6000,
+                   metric_mode=config.get("metric_mode", "exact"))
+    protocol = dict(protocol_id="pid", modes=["uniform", "pullback"],
+                    seeds=[0, 1], updates=6000, cache_sha256="other",
+                    warm_start_sha256="other")
+    assert C.verify_student_provenance(payload, protocol, config, "warm.pt") is True
+    metric_payload = dict(payload, mode="pullback")
+    try:
+        C.verify_student_provenance(metric_payload, protocol, config, "x.pt")
+    except C.ProtocolError:
+        pass
+    else:
+        raise AssertionError("unlocked metric checkpoint accepted as warm start")
+    return dict(warm_start_accepted=True, unlocked_metric_rejected=True)
+
+
+def check_device_key_normalization():
+    import torch
+    from hri_adapter import _device_key
+    assert _device_key("cuda") == _device_key("cuda:0"), "cuda != cuda:0"
+    assert _device_key("cuda:0") != _device_key("cuda:1"), "cuda:0 == cuda:1"
+    assert _device_key("cpu") == _device_key("cpu")
+    return dict(cuda_equals_cuda0=True)
+
+
 def check_spearman():
     from scipy.stats import spearmanr
     a = np.array([1.0, 2.0, 2.0, 3.0, 3.0])
@@ -213,15 +276,35 @@ def check_reserve_and_completion(tmpdir):
 def check_protocol_and_analysis(config, config_path, tmpdir):
     protocols = {}
     upstream = C.upstream_hashes(config["repository"])
+    smoke = os.path.join(tmpdir, "smoke.json")
+    cache = os.path.join(tmpdir, "cache.npz")
+    warm = os.path.join(tmpdir, "warm.pt")
+    with open(smoke, "w") as handle:
+        json.dump({"passed": True}, handle)
+    np.savez(cache, contexts=np.zeros(1))
+    with open(warm, "wb") as handle:
+        handle.write(b"warm")
     protocol = dict(modes=["pullback", "endpoint"], seeds=[0, 1],
                     final_scenes=[10, 11], protocol_id="pid",
                     source_hashes=C.source_hashes(), upstream=upstream,
                     upstream_commit=C.upstream_commit(config["repository"]),
                     packages=C.package_versions(["numpy"]),
                     resolved_config=config, assets=C.asset_hashes(config),
-                    checkpoint_sha256=None, normalizer_sha256=None)
+                    checkpoint_sha256=None, normalizer_sha256=None,
+                    smoke_report=smoke, smoke_report_sha256=C.sha256_file(smoke),
+                    cache=cache, cache_sha256=C.sha256_file(cache),
+                    warm_start=warm, warm_start_sha256=C.sha256_file(warm))
     C.verify_current_protocol(protocol, config, config_path)
     protocols["fresh_lock_verified"] = True
+    missing = dict(protocol)
+    os.remove(cache)
+    try:
+        C.verify_current_protocol(missing, config, config_path)
+    except C.ProtocolError:
+        protocols["missing_artifact_rejected"] = True
+    else:
+        raise AssertionError("missing locked artifact accepted")
+    np.savez(cache, contexts=np.zeros(1))
     stale = dict(protocol)
     stale["source_hashes"] = {"experiment/core.py": "deadbeef"}
     try:
@@ -299,7 +382,9 @@ def main():
     parser.add_argument("--require-torch", action="store_true")
     args = parser.parse_args()
     config, config_path = load_config()
-    results = {"linear_algebra": check_linear_algebra(),
+    results = {"metric_subset_spread": check_metric_subset_spread(config),
+               "warm_provenance": check_warm_provenance_accepted(config),
+               "linear_algebra": check_linear_algebra(),
                "config_validation": check_config_validation(),
                "spearman_ties": check_spearman(),
                "manifest": check_manifest()}
@@ -310,6 +395,8 @@ def main():
             config, config_path, tmpdir)
     try:
         import torch
+        results["empty_metric_count"] = check_empty_metric_count()
+        results["device_keys"] = check_device_key_normalization()
         from core import (TwoStepStudent, objective, pullback_metric_exact,
                           pullback_probes, pullback_quadratic, pullback_trace)
         torch.manual_seed(0)
