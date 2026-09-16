@@ -15,10 +15,10 @@ import numpy as np
 
 SCHEMA_VERSION = 3
 
-SOURCE_FILES = ["contract.py", "hri_adapter.py", "pairs.py", "train.py",
-                "geometry.py", "correction.py", "evaluate.py", "readiness.py",
-                "lock.py", "analyze.py", "cli.py", "collect.py", "sanity.py",
-                "config.json"]
+SOURCE_FILES = ["../gad_reference.py", "contract.py", "hri_adapter.py",
+                "pairs.py", "train.py", "geometry.py", "correction.py",
+                "evaluate.py", "readiness.py", "lock.py", "analyze.py",
+                "cli.py", "collect.py", "sanity.py", "config.json"]
 PACKAGES = ["torch", "torchvision", "numpy", "scipy", "pandas", "gym",
             "pygame", "pymunk", "shapely", "cv2", "skimage", "zarr",
             "diffusers", "imageio_ffmpeg"]
@@ -47,11 +47,11 @@ POSITIVE_INTS = ["teacher_steps", "execute_steps", "episode_steps", "width",
 ALLOWED_ARMS = {"anchor", "augmented", "gad"}
 
 HISTORY_CONTEXT_KEYS = ("history_id", "scene", "split", "decision", "history",
-                        "sig_initial", "sig_live", "condition", "endpoint",
-                        "collector_hash")
+                        "sig_initial", "sig_live", "condition", "q",
+                        "endpoint", "collector_hash")
 PAIR_RECORD_KEYS = ("pair_id", "history_id", "anchor_id", "direction_id",
-                    "q", "u", "rho", "source", "t0", "t1", "condition",
-                    "teacher_steps")
+                    "split", "q", "u", "rho", "source", "t0", "t1",
+                    "condition", "teacher_steps")
 PAIR_META_KEYS = ("member_keys", "rho", "source", "teacher_steps")
 
 
@@ -213,6 +213,11 @@ def reserve_outputs(paths):
     already exists, so two processes can never share one artifact.
     """
     for path in paths:
+        # Item 25: reservation also creates parent dirs (no ad hoc
+        # makedirs at write sites) and happens before any work.
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         if os.path.exists(path) or os.path.exists(path + COMPLETION_SUFFIX) \
                 or os.path.exists(path + RESERVED_SUFFIX):
             raise ProtocolError(f"output already exists or reserved: {path}")
@@ -342,17 +347,38 @@ def atomic_savez(path, **arrays):
         raise
 
 
+def _check_checkpoint_node(node, trail, _torch):
+    import torch as _t
+    _torch = _torch or _t
+    if isinstance(node, _torch.Tensor):
+        if not _torch.isfinite(node).all():
+            raise ProtocolError(f"atomic_save_torch: nonfinite {trail}")
+        return
+    if node is None or isinstance(node, (str, int, float, bool)):
+        return
+    if isinstance(node, (list, tuple)):
+        for i, item in enumerate(node):
+            _check_checkpoint_node(item, f"{trail}[{i}]", _torch)
+        return
+    if isinstance(node, dict):
+        for key, item in node.items():
+            if not isinstance(key, str):
+                raise ProtocolError(
+                    f"atomic_save_torch: non-string key {key!r} at {trail}")
+            _check_checkpoint_node(item, f"{trail}.{key}", _torch)
+        return
+    raise ProtocolError(
+        f"atomic_save_torch: {trail} has disallowed type "
+        f"{type(node).__name__}; checkpoints hold tensors and primitive "
+        "containers only, never pickled modules")
+
+
 def atomic_save_torch(path, state_dict):
     import torch as _torch
     if not isinstance(state_dict, dict):
         raise ProtocolError("atomic_save_torch requires a state dict, "
                             "never a pickled module")
-    for key, value in state_dict.items():
-        if not isinstance(value, _torch.Tensor):
-            raise ProtocolError(f"atomic_save_torch {path}: {key} is not "
-                                "a Tensor; refusing to pickle modules")
-        if not _torch.isfinite(value).all():
-            raise ProtocolError(f"atomic_save_torch {path}: nonfinite {key}")
+    _check_checkpoint_node(state_dict, "payload", _torch)
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(suffix=".pt", dir=directory,
@@ -400,14 +426,51 @@ def cache_fingerprint(config, repository=None):
     return fingerprint
 
 
+def _strict_list(value, name):
+    import numpy as _np
+    if isinstance(value, _np.ndarray):
+        if not _np.isfinite(value).all():
+            raise ProtocolError(f"nonfinite {name} in cache record")
+        return value.astype(_np.float64).tolist()
+    if isinstance(value, (list, tuple)):
+        return [_strict_list(v, name) for v in value]
+    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+        if isinstance(value, str):
+            raise ProtocolError(
+                f"unsupported string object for {name}; serialize arrays "
+                "as numeric lists, never via default=str")
+        return value
+    raise ProtocolError(
+        f"unsupported type {type(value).__name__} for {name}; store "
+        "numeric lists only")
+
+
+# String-valued history keys: legit nonempty strings. Every other key
+# must be numeric: a str there means a stringified array and is rejected.
+HISTORY_STRING_KEYS = ("history_id", "split", "collector_hash")
+
+
 def write_history_cache(path, contexts, config, repository=None):
+    serial = []
     for context in contexts:
         missing = [k for k in HISTORY_CONTEXT_KEYS if k not in context]
         if missing:
             raise ProtocolError(f"history context missing keys {missing}")
+        entry = {}
+        for k in HISTORY_CONTEXT_KEYS:
+            if k in HISTORY_STRING_KEYS:
+                value = context[k]
+                if not isinstance(value, str) or not value:
+                    raise ProtocolError(
+                        f"{k} must be a nonempty string, got "
+                        f"{type(value).__name__}")
+                entry[k] = value
+            else:
+                entry[k] = _strict_list(context[k], k)
+        serial.append(entry)
     payload = {"schema_version": SCHEMA_VERSION,
                "fingerprint": cache_fingerprint(config, repository),
-               "histories": list(contexts)}
+               "histories": serial}
     _atomic_json(path, payload)
     return payload
 
@@ -457,11 +520,18 @@ def _to_list(value):
 
 
 def write_pair_bank(path, records, meta, config, lineage=None):
+    # Item 5: the bank is train-only by construction; validation/
+    # diagnostic/final records are rejected at the producer, and trainers
+    # re-assert on consume.
     serial = []
     for record in records:
         missing = [k for k in PAIR_RECORD_KEYS if k not in record]
         if missing:
             raise ProtocolError(f"pair record missing keys {missing}")
+        if record.get("split") != "train":
+            raise ProtocolError(
+                f"pair bank is train-only; refusing split "
+                f"{record.get('split')!r}")
         serial.append({k: _to_list(record[k]) for k in PAIR_RECORD_KEYS})
     missing_meta = [k for k in PAIR_META_KEYS if k not in meta]
     if missing_meta:
@@ -494,6 +564,10 @@ def verify_pair_bank(path, config):
         missing = [k for k in PAIR_RECORD_KEYS if k not in record]
         if missing:
             raise ProtocolError(f"pair record missing keys {missing}")
+        if record.get("split") != "train":
+            raise ProtocolError(
+                f"pair bank holds non-train split {record.get('split')!r}; "
+                "training banks are train-only")
         for key in ("q", "u", "t0", "t1", "condition"):
             record[key] = _as_float_array(record[key], key)
         record["pair_id"] = list(record["pair_id"])
@@ -522,13 +596,14 @@ def upstream_commit(repository):
 
 def canonical_design(config, modes, seeds, updates, arms, scenes,
                      correction, beta_selected, rho, compute, references,
-                     warm=None, bank=None, cache=None):
+                     warm=None, bank=None, cache=None, primary_contrast=None):
     design = {"schema_version": SCHEMA_VERSION,
               "config": dict(config),
               "modes": sorted(modes),
               "seeds": sorted(int(s) for s in seeds),
               "updates": int(updates),
               "arms": sorted(arms),
+              "primary_contrast": list(primary_contrast or []),
               "scenes": {k: sorted(int(s) for s in v)
                          for k, v in sorted(scenes.items())},
               "correction": correction,
@@ -556,7 +631,13 @@ def load_protocol(path):
         return json.load(handle)
 
 
-def verify_current_protocol(protocol, config, config_path, repository=None):
+ALLOWED_STAGES = ("readiness", "collect", "warm", "pairs", "train",
+                  "geometry", "correction", "evaluate", "lock", "analyze",
+                  "verify_run")
+
+
+def verify_current_protocol(protocol, config, config_path, repository=None,
+                            stage=None):
     repository = repository or config.get("repository")
     if protocol.get("schema_version") != SCHEMA_VERSION:
         raise ProtocolError("protocol schema mismatch")
@@ -575,12 +656,15 @@ def verify_current_protocol(protocol, config, config_path, repository=None):
         if recomputed != design.get("design_id"):
             raise ProtocolError("PROTOCOL_MISMATCH: canonical design id "
                                 "does not recompute")
+    if stage is not None and stage not in ALLOWED_STAGES:
+        raise ProtocolError(
+            f"unknown stage {stage!r}; expected one of {ALLOWED_STAGES}")
     for key in ("artifacts",):
         for entry in (protocol.get(key) or {}).values():
             ref = entry if isinstance(entry, str) else entry.get("path", entry)
             if isinstance(ref, str) and os.path.exists(ref):
                 verify_completed(ref)
-    return {"design_id": recomputed,
+    return {"design_id": recomputed, "stage": stage,
             "upstream_commit": upstream_commit(repository)}
 
 
@@ -600,14 +684,23 @@ def verify_student_provenance(payload, protocol, config, path,
         if design.get("seeds") and int(payload.get("seed", -1)) not in \
                 [int(s) for s in design["seeds"]]:
             problems.append("checkpoint seed is not a locked seed")
+        # Item 22: history cache, pair bank, and init hashes are
+        # distinct artifact types. A warm checkpoint's history_sha256 is
+        # checked against the locked history (design cache_sha256); a
+        # final student's pair_bank_sha256 against the locked bank.
         if design.get("bank_sha256", "absent") != "absent" and \
-                payload.get("bank_sha256") not in (None, design["bank_sha256"]):
+                payload.get("pair_bank_sha256",
+                            payload.get("bank_sha256")) not in \
+                (None, design["bank_sha256"]):
             problems.append("checkpoint bank differs from the locked bank")
     if role == "init":
         if protocol is None:
             problems.append("init role requires the lock holding warm_sha256")
         elif sha256_file(path) != design.get("warm_sha256", "absent"):
             problems.append("init file hash != locked warm_sha256")
+        elif payload.get("history_sha256") not in \
+                (None, design.get("cache_sha256", "absent")):
+            problems.append("warm history differs from the locked history")
     if role == "final":
         if payload.get("protocol_id") is None and protocol is not None:
             problems.append("unlocked checkpoint cannot serve as final student")
@@ -618,6 +711,30 @@ def verify_student_provenance(payload, protocol, config, path,
         raise ProtocolError("checkpoint provenance mismatch for " + str(path)
                             + ": " + "; ".join(problems))
     return True
+
+
+READINESS_MIN_SUCCESS = 0.50
+READINESS_MIN_SCORE = 0.65
+
+
+def readiness_gate(conventions, source, steps):
+    """Item 24: ONE shared gate over the predeclared replicate set.
+
+    Aggregates all replicate rows of the (source, steps) convention and
+    passes on mean success >= 0.50 or mean score >= 0.65. Both the
+    readiness report and the lock call this function, so the criterion
+    cannot drift between them.
+    """
+    rows = [c for c in (conventions or [])
+            if c.get("source") == source and int(c.get("steps", -1)) == int(steps)]
+    if not rows:
+        return dict(passed=False, reason="no rows for the convention")
+    success = float(sum(r.get("success", 0.0) for r in rows) / len(rows))
+    score = float(sum(r.get("score", 0.0) for r in rows) / len(rows))
+    passed = success >= READINESS_MIN_SUCCESS or score >= READINESS_MIN_SCORE
+    return dict(passed=passed, success=success, score=score, n=len(rows),
+                min_success=READINESS_MIN_SUCCESS,
+                min_score=READINESS_MIN_SCORE)
 
 
 def compute_env(device="cuda"):

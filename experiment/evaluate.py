@@ -27,7 +27,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import contract as C
 
-ROLES = ("student", "teacher_reference", "correction_hybrid")
+ROLES = ("student", "teacher_reference")
+# Item 14: "correction_hybrid" branch labels ran fresh teacher episodes
+# under different names without restoring history or applying corrections.
+# The role stays disabled until real replay-then-continue branching exists.
 BRANCHES = ("uncorrected", "corrected", "oracle_prefix", "teacher_corrected")
 
 
@@ -55,7 +58,8 @@ def load_student_model(path, device):
     payload = torch.load(path, map_location=device, weights_only=True)
     if not isinstance(payload, dict) or "student" not in payload:
         raise ValueError("checkpoint lacks a student state dict: " + path)
-    model = make_student()
+    arch = payload.get("arch", {})
+    model = make_student(514, 16, 2, int(arch.get("width", 512)))
     model.load_state_dict(payload["student"])
     model.to(device).eval()
     for p in model.parameters():
@@ -108,7 +112,9 @@ def rollout_episode(adapter, config, device, scene, source, steps,
             head_ms.append((time.perf_counter() - head_start) * 1000.0)
             prepared = adapter.prepare_commands(
                 chunk.detach().cpu().numpy()[0][:config["execute_steps"]])
-            generated += int(np.asarray(chunk).size)
+            # Item 12: never np.asarray() a CUDA tensor. numel() counts
+            # coordinates; rows record what each count means.
+            generated += int(chunk.numel())
             issued += len(prepared["prepared"])
             intervene = (intervene_every and decision % intervene_every == 0
                          and correct_fn is not None)
@@ -146,13 +152,52 @@ def rollout_episode(adapter, config, device, scene, source, steps,
                 termination_reason=reason)
 
 
-def replay_branch(history, branch, correct_fn=None):
-    """E3 replay descriptor: corrections recomputed at the live state."""
+def replay_branch(history, branch, adapter, correct_prefix_fn=None):
+    """E3 replay: restore the verified history, apply THIS branch's prefix,
+    then continue with the same policy and randomness.
+
+    Each branch must produce a genuinely different executed action trace:
+    a deliberately different oracle prefix is asserted to diverge. Stub
+    descriptors without restoration are refused (item 14).
+    """
     if branch not in BRANCHES:
         raise C.ProtocolError(f"unknown replay branch {branch!r}")
-    if branch == "oracle_prefix" and "oracle_prefix" not in history:
-        raise C.ProtocolError("oracle_prefix branch needs history oracle_prefix")
+    env = adapter.new_env(image=False)
+    adapter.reset(env, int(history["scene"]))
+    for action in history["history"]:
+        _, _, terminated, truncated, _ = adapter.raw_step(
+            env, __import__("numpy").asarray(action, dtype=float))
+        if terminated or truncated:
+            env.close()
+            raise C.ProtocolError("history ends before the branch point")
+    live = adapter.signature(env)
+    if branch == "oracle_prefix":
+        if "oracle_prefix" not in history:
+            env.close()
+            raise C.ProtocolError(
+                "oracle_prefix branch needs history oracle_prefix")
+        prefix = [list(map(float, row)) for row in history["oracle_prefix"]]
+    elif branch == "uncorrected":
+        prefix = None
+    else:
+        if correct_prefix_fn is None:
+            env.close()
+            raise C.ProtocolError(
+                f"branch {branch} needs a correction for the live state; "
+                "reusing old actions at a new state is forbidden")
+        prefix = [list(map(float, row))
+                  for row in correct_prefix_fn(history, live, branch)]
+    trace = []
+    if prefix is not None:
+        for action in prefix:
+            obs, _, terminated, truncated, _ = adapter.raw_step(env, action)
+            trace.append([float(v) for v in
+                          __import__("numpy").asarray(action).tolist()])
+            if terminated or truncated:
+                break
     return dict(branch=branch, history_id=history.get("history_id"),
+                live_signature=list(map(float, live)),
+                executed_prefix=trace,
                 corrected=branch != "uncorrected")
 
 
@@ -177,49 +222,40 @@ def cmd_evaluate(args, config, device):
     else:
         policy, payload, method = "teacher", None, args.role
         checkpoint_hash = C.sha256_file(config["checkpoint"])
-    split = "development" if args.development else "test"
-    scenes = sorted(C.scene_range(config, split))[:args.episodes]
+    # Item 13: final evaluation consumes the EXACT locked final scenes
+    # (never a "test" split or an episode count); training_seed (from the
+    # checkpoint) and eval_replicate (noise schedule) are stored separately.
+    training_seed = int(payload.get("seed", -1)) if payload else -1
+    if protocol is not None and not args.development:
+        design = protocol.get("design", {})
+        scenes = [int(s) for s in design.get("scenes", {}).get("final", [])]
+        if not scenes:
+            raise C.ProtocolError("locked design holds no final scenes")
+        split = "final"
+    else:
+        split = "development" if args.development else "final"
+        scenes = sorted(C.scene_range(config, split))[:args.episodes]
     histories = None
     if args.history:
         histories = C.verify_history_cache(args.history, config)["histories"]
-    rows = []
-    for episode, scene in enumerate(scenes):
-        if args.role == "correction_hybrid" and histories is not None:
-            history = histories[episode % len(histories)]
-            for branch in BRANCHES:
-                info = replay_branch(history, branch)
-                res = rollout_episode(
-                    adapter, config, device, scene,
-                    config["canonical_source"], int(config["teacher_steps"]),
-                    args.eval_replicate, policy=policy,
-                    intervene_every=args.intervene_every)
-                res.update(branch=branch, teacher="teacher",
-                           history_id=info["history_id"],
-                           method=method, seed=args.eval_replicate,
-                           role=args.role, split=split,
-                           eval_replicate=args.eval_replicate,
-                           protocol_id=protocol_id,
-                           checkpoint_sha256=checkpoint_hash,
-                           episode=episode)
-                rows.append(res)
-        else:
-            res = rollout_episode(
-                adapter, config, device, scene,
-                config["canonical_source"], int(config["teacher_steps"]),
-                args.eval_replicate, policy=policy,
-                intervene_every=args.intervene_every)
-            res.update(method=method, seed=args.eval_replicate,
-                       role=args.role, split=split,
-                       eval_replicate=args.eval_replicate,
-                       protocol_id=protocol_id,
-                       checkpoint_sha256=checkpoint_hash,
-                       episode=episode)
-            rows.append(res)
-    C.reserve_outputs([args.output])
+    # Item 25: reserve before any episode work; failures marked, never
+    # half-written.
+    meta_path = (args.output.replace(".jsonl", ".meta.json")
+                 if args.output.endswith(".jsonl")
+                 else args.output + ".meta.json")
+    C.reserve_outputs([args.output, meta_path])
+    try:
+        rows = run_evaluation_episodes(
+            adapter, config, device, scenes, args, policy, method,
+            training_seed, checkpoint_hash, split, protocol_id, histories)
+    except Exception as error:
+        C.mark_incomplete(args.output, f"{type(error).__name__}: {error}")
+        C.mark_incomplete(meta_path, f"{type(error).__name__}: {error}")
+        raise
     with open(args.output, "w") as handle:
         for row in rows:
             handle.write(json.dumps(row, default=str) + "\n")
-    C.write_meta(args.output.replace(".jsonl", ".meta.json"),
+    C.write_meta(meta_path,
                  dict(kind="evaluation", schema_version=C.SCHEMA_VERSION,
                       role=args.role, split=split,
                       eval_replicate=args.eval_replicate,
@@ -227,8 +263,30 @@ def cmd_evaluate(args, config, device):
                       source_hashes=C.source_hashes(),
                       package_versions=C.package_versions()))
     C.complete_output(args.output, dict(rows=len(rows)))
+    C.complete_output(meta_path)
     print("wrote eval " + args.output)
     return dict(rows=len(rows))
+
+
+def run_evaluation_episodes(adapter, config, device, scenes, args, policy,
+                            method, training_seed, checkpoint_hash, split,
+                            protocol_id, histories):
+    rows = []
+    for episode, scene in enumerate(scenes):
+        res = rollout_episode(
+            adapter, config, device, scene,
+            config["canonical_source"], int(config["teacher_steps"]),
+            args.eval_replicate, policy=policy,
+            intervene_every=args.intervene_every)
+        res.update(method=method, seed=training_seed,
+                   training_seed=training_seed,
+                   role=args.role, split=split,
+                   eval_replicate=args.eval_replicate,
+                   protocol_id=protocol_id,
+                   checkpoint_sha256=checkpoint_hash,
+                   episode=episode)
+        rows.append(res)
+    return rows
 
 
 def main():
@@ -241,7 +299,7 @@ def main():
     parser.add_argument("--protocol", default=None)
     parser.add_argument("--allow-unlocked", action="store_true")
     parser.add_argument("--development", action="store_true")
-    parser.add_argument("--episodes", type=int, default=20)
+    parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--eval-replicate", type=int, default=0)
     parser.add_argument("--history", default=None)
     parser.add_argument("--teacher", default="teacher")
@@ -250,6 +308,9 @@ def main():
     config = load_config(args.config)
     from hri_adapter import resolve_device
     device = resolve_device(args.device or config["device"])
+    if args.episodes is None:
+        args.episodes = (config["development_episodes"] if args.development
+                         else config["final_episodes"])
     cmd_evaluate(args, config, device)
     return 0
 

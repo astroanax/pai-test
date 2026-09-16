@@ -94,24 +94,29 @@ def main():
                                     steps=convention["steps"],
                                     replicate=replicate, scenes=scenes,
                                     n=len(rows), per_scene=rows, **summary))
-    gate = dict(min_success=GATE_SUCCESS,
+    gate = dict(min_success=C.READINESS_MIN_SUCCESS,
+                min_score=C.READINESS_MIN_SCORE,
                 min_coverage_scenes=MIN_COVERAGE_SCENES)
     passing = [c for c in conventions
-               if c["success"] >= GATE_SUCCESS
+               if c["success"] >= C.READINESS_MIN_SUCCESS
                and c["coverage_scenes"] >= MIN_COVERAGE_SCENES]
+    shared = C.readiness_gate(conventions, config["canonical_source"],
+                              int(config["teacher_steps"]))
+    passed = bool(passing) and bool(shared["passed"])
     report = dict(kind="teacher_readiness", schema_version=SCHEMA_VERSION,
                   config_sha256=sha256_file(args.config),
                   checkpoint_sha256=sha256_file(config["checkpoint"]),
                   source_hashes=source_hashes(),
                   package_versions=package_versions(),
                   conventions=conventions, gate=gate,
-                  passed=bool(passing),
+                  shared_gate=shared,
+                  passed=passed,
                   passing=[c["name"] for c in passing],
                   compute=C.compute_env(config.get("device", "cuda")))
     reserve_outputs([args.output])
     write_meta(args.output, report)
     complete_output(args.output, dict(conventions=len(conventions)))
-    if not passing:
+    if not passed:
         raise ProtocolError(
             "readiness gate failed: no convention reached success >= "
             f"{GATE_SUCCESS} with coverage >= {MIN_COVERAGE_SCENES} scenes; "

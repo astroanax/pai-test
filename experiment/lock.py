@@ -29,8 +29,9 @@ def main():
     parser.add_argument("--config", default="experiment/config.json")
     parser.add_argument("--output", default="runs/protocol_locked.json")
     parser.add_argument("--readiness-report", required=True)
-    parser.add_argument("--base-report", default=None,
-                        help="base-student dev report for the 0.30 floor")
+    parser.add_argument("--base-report", required=True,
+                        help="development evaluation file (jsonl) of the "
+                             "augmented base student for the 0.30 floor")
     parser.add_argument("--warm", required=True)
     parser.add_argument("--bank", required=True)
     parser.add_argument("--history", required=True)
@@ -65,23 +66,38 @@ def main():
     if readiness.get("config_sha256") != C.sha256_file(args.config):
         raise ValueError("readiness report was built for a different config")
     locked_conv = [(config["canonical_source"], int(config["teacher_steps"]))]
-    rows = [c for c in readiness.get("conventions", [])
-            if (c.get("source"), c.get("steps")) in locked_conv]
-    if not any(c.get("success", 0.0) >= 0.50 or c.get("score", 0.0) >= 0.65
-               for c in rows):
-        raise ValueError("no passing readiness row for the locked "
-                         "source/solver convention (need success >= 0.50 "
-                         "or score >= 0.65); do not train students")
+    gate = C.readiness_gate(readiness.get("conventions"),
+                            config["canonical_source"],
+                            int(config["teacher_steps"]))
+    if not gate["passed"]:
+        raise ValueError(f"readiness gate failed for the locked convention: "
+                         f"{gate}; do not train students")
+    print(f"[lock] teacher readiness: {gate}")
 
-    if args.base_report:
-        C.verify_completed(args.base_report)
-        with open(args.base_report) as handle:
-            base = json.load(handle)
-        aug = base.get("augmented_dev_success")
-        if aug is None or float(aug) < MIN_AUGMENTED_DEV_SUCCESS:
-            raise ValueError(
-                f"base-student floor failed: augmented dev success {aug} < "
-                f"{MIN_AUGMENTED_DEV_SUCCESS}")
+    C.verify_completed(args.base_report)
+    base_sidecar = (args.base_report.replace(".jsonl", ".meta.json")
+                    if args.base_report.endswith(".jsonl")
+                    else args.base_report + ".meta.json")
+    if not os.path.exists(base_sidecar):
+        raise ValueError("base report has no sidecar; rebuild the evaluation")
+    with open(base_sidecar) as handle:
+        base_meta = json.load(handle)
+    if base_meta.get("schema_version") != C.SCHEMA_VERSION:
+        raise ValueError("base report schema mismatch; rebuild the evaluation")
+    base_rows = [json.loads(line) for line in open(args.base_report)
+                 if line.strip()]
+    aug_rows = [r for r in base_rows
+                if r.get("method") == "augmented"
+                and r.get("split") == "development"]
+    if not aug_rows:
+        raise ValueError("base report holds no development augmented rows")
+    aug = sum(int(r.get("success", 0)) for r in aug_rows) / len(aug_rows)
+    if float(aug) < MIN_AUGMENTED_DEV_SUCCESS:
+        raise ValueError(
+            f"base-student floor failed: augmented dev success {aug:.3f} < "
+            f"{MIN_AUGMENTED_DEV_SUCCESS}")
+    print(f"[lock] base floor: augmented dev success {aug:.3f} "
+          f"over {len(aug_rows)} episodes")
 
     for path, role in ((args.warm, None), (args.bank, None),
                        (args.history, None)):
@@ -111,10 +127,14 @@ def main():
                         replicate=0, scenes=scenes["final"]),
     }
     compute = C.compute_env(config.get("device", "cuda"))
+    # Item 19: lock was calling canonical_design with a single dict
+    # (TypeError: missing required args), so no principal lock could ever
+    # be created, and the primary contrast was never persisted.
     design = C.canonical_design(
         config, arms, seeds, updates, arms, scenes, correction,
         float(args.beta_selected), rho, compute, references,
-        warm=args.warm, bank=args.bank, cache=args.history)
+        warm=args.warm, bank=args.bank, cache=args.history,
+        primary_contrast=PRIMARY_CONTRAST)
     protocol = dict(
         protocol_id=C.design_id(design), design=design,
         sources=C.source_hashes(), config_file=C.sha256_file(args.config),

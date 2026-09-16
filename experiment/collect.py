@@ -83,12 +83,15 @@ def collect_histories(adapter, config, device, scenes, split, driver,
             endpoint = chunk.detach().cpu().numpy()[0].astype(np.float32)
             prepared = adapter.prepare_commands(
                 chunk.detach().cpu().numpy()[0][:config["execute_steps"]])
+            # Item 4: retain the generating canonical latent q alongside
+            # its endpoint, so warm training pairs (q, T(q,c)) exactly.
             contexts.append(dict(
                 history_id=f"{split}-{scene}-{decision}",
                 scene=int(scene), split=split, decision=int(decision),
                 history=[list(map(float, row)) for row in history],
                 sig_initial=sig_initial, sig_live=sig_live,
                 condition=cond.detach().cpu().numpy()[0].astype(np.float32),
+                q=latent.detach().cpu().numpy()[0].astype(np.float32),
                 endpoint=endpoint,
                 collector_hash=collect_histories.collector_hash))
             for action in prepared["prepared"]:
@@ -117,7 +120,8 @@ def cmd_collect(args, config, device):
         _sys.path.insert(0, os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))))
         from gad_reference import make_student
-        student = make_student()
+        width = int(config.get("width", 512))
+        student = make_student(514, 16, 2, width)
         student.load_state_dict(payload["student"])
         student.to(device).eval()
         for p in student.parameters():

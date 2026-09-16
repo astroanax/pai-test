@@ -241,20 +241,25 @@ class HRIAdapter:
         """
         env = self.new_env(image=False)
         self.reset(env, scene)
+        initial = self.signature(env)
         history = list(history)
         terminal, truncated = False, False
+        cause = None
         for position, action in enumerate(history):
             _, _, terminated, trunc, _ = self.raw_step(env, np.asarray(action, dtype=np.float64))
-            terminal = bool(terminated)
-            truncated = bool(trunc or truncated)
-            if terminal and position < len(history) - 1:
+            if terminated:
+                terminal, cause = True, "terminated"
+            if trunc:
+                truncated, cause = True, cause or "truncated"
+            if (terminal or truncated) and position < len(history) - 1:
                 env.close()
-                raise ValueError("history continues after episode termination")
-        return env, terminal, truncated
+                raise ValueError(
+                    f"history continues after episode {cause}")
+        return env, terminal, truncated, initial
 
     def execute_from_history(self, scene, history, normalized_prefix):
         commands = self.commands_for_execution(normalized_prefix)
-        env, terminal, truncated = self.replay(scene, history)
+        env, terminal, truncated, _ = self.replay(scene, history)
         if terminal or truncated:
             frozen = self.features(env)
             env.close()
@@ -275,7 +280,7 @@ class HRIAdapter:
         expected = np.asarray(signature, dtype=np.float64)
         if not np.isfinite(expected).all():
             raise ValueError("recorded replay signature is nonfinite")
-        env, _, _ = self.replay(scene, history)
+        env, _, _, _ = self.replay(scene, history)
         try:
             replayed = self.signature(env)
         finally:

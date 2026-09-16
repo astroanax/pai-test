@@ -175,20 +175,27 @@ def paired_loss(
         raise ValueError("direction must have unit L2 norm per pair")
     base = latent.detach()
     perturbed = base + float(radius) * direction.detach()
+    # Item 6: A0 duplicates the anchor input AND the anchor target, so the
+    # anchor loss is plain anchor MSE. Every arm runs ONE 2B forward (2B
+    # sample evaluations); the trainer's anchor arm runs two B forwards,
+    # which is the same 2B count. Never B + 2B-with-half-discarded (3B).
     second_input = base if mode == "anchor" else perturbed
-    pred_anchor = student(base, condition)
-    pred_second = student(
+    target_second = teacher_anchor if mode == "anchor" else teacher_perturbed
+    predictions = student(
         torch.cat([base, second_input], dim=0),
-        torch.cat([condition, condition], dim=0),
-    )[b:]
+        torch.cat([condition.detach(), condition.detach()], dim=0),
+    )
+    if predictions.shape != (2 * b, *base.shape[1:]):
+        raise ValueError("student output shape mismatch")
+    pred_anchor, pred_second = predictions.chunk(2, dim=0)
     if pred_anchor.shape != teacher_anchor.shape:
         raise ValueError("teacher_anchor must match student output shape")
-    if pred_second.shape != teacher_perturbed.shape:
+    if pred_second.shape != target_second.shape:
         raise ValueError("teacher_perturbed must match student output shape")
     require_finite(pred_anchor, "pred_anchor")
     require_finite(pred_second, "pred_second")
     mse_anchor = torch.mean((pred_anchor - teacher_anchor.detach()) ** 2)
-    mse_second = torch.mean((pred_second - teacher_perturbed.detach()) ** 2)
+    mse_second = torch.mean((pred_second - target_second.detach()) ** 2)
     value = 0.5 * (mse_anchor + mse_second)
     if mode == "anchor":
         response = torch.zeros((), device=value.device, dtype=value.dtype)
@@ -208,6 +215,7 @@ def paired_loss(
         "value": value.detach(),
         "response": response.detach(),
         "pair_count": b,
+        "sample_evals": 2 * b,
     }
 
 
@@ -272,67 +280,73 @@ def invert_prefix(
         reg = torch.mean((candidate - origin).flatten(1) ** 2, dim=1)
         return prefix_mse + float(gamma) * reg, prefix_mse
 
+    # Item 11: exactly ONE model evaluation per iterate. The q0
+    # evaluation (no grad) seeds selection; each of the K steps evaluates
+    # once with grad, and that same output serves selection AND the
+    # backward. Reported counts are observed, not aspirational:
+    # K+1 forwards, K backwards, B*(K+1) sample evaluations.
     try:
         origin = initial.detach().clone()
         trust_l2 = float(trust_rms) * math.sqrt(initial[0].numel())
+        forwards = 0
         with torch.no_grad():
             action0 = model(origin, condition.detach())
+            forwards += 1
             objective0, prefix0 = per_case(action0, origin, origin)
         best_latent = origin.clone()
         best_action = action0.detach().clone()
         best_objective = objective0.detach().clone()
         best_prefix = prefix0.detach().clone()
         current = origin.clone()
-        for i in range(steps + 1):
+        for _ in range(steps):
             with torch.enable_grad():
                 candidate = current.detach().requires_grad_(True)
                 action = model(candidate, condition.detach())
-                objective, _ = per_case(action, candidate, origin)
+                forwards += 1
+                objective, prefix = per_case(action, candidate, origin)
                 total = torch.sum(objective)
-            if i < steps:
-                grads = torch.autograd.grad(total, candidate)[0].detach()
-                current = current - float(learning_rate) * grads
-                with torch.no_grad():
-                    delta = current - origin
-                    flat = delta.flatten(1)
-                    norms = flat.norm(p=2, dim=1)
-                    over = norms > trust_l2
-                    if bool(over.any()):
-                        scale = torch.ones_like(norms)
-                        scale[over] = trust_l2 / norms[over]
-                        current = origin + (
-                            flat * scale.unsqueeze(1)
-                        ).reshape_as(delta)
             with torch.no_grad():
-                eval_action = model(current, condition.detach())
-                eval_objective, eval_prefix = per_case(eval_action, current, origin)
-                improved = eval_objective < best_objective
+                improved = objective.detach() < best_objective
                 if bool(improved.any()):
                     idx = improved.unsqueeze(1)
                     flat_best = best_latent.flatten(1)
-                    flat_cur = current.flatten(1)
+                    flat_cur = candidate.detach().flatten(1)
                     best_latent = torch.where(
                         idx.expand_as(flat_best), flat_cur, flat_best
                     ).reshape_as(best_latent)
                     flat_ba = best_action.flatten(1)
-                    flat_ea = eval_action.detach().flatten(1)
+                    flat_ea = action.detach().flatten(1)
                     best_action = torch.where(
                         idx.expand_as(flat_ba), flat_ea, flat_ba
                     ).reshape_as(best_action)
                     best_objective = torch.where(
-                        improved, eval_objective.detach(), best_objective
+                        improved, objective.detach(), best_objective
                     )
                     best_prefix = torch.where(
-                        improved, eval_prefix.detach(), best_prefix
+                        improved, prefix.detach(), best_prefix
                     )
+            grads = torch.autograd.grad(total, candidate)[0].detach()
+            current = candidate.detach() - float(learning_rate) * grads
+            with torch.no_grad():
+                delta = current - origin
+                flat = delta.flatten(1)
+                norms = flat.norm(p=2, dim=1)
+                over = norms > trust_l2
+                if bool(over.any()):
+                    scale = torch.ones_like(norms)
+                    scale[over] = trust_l2 / norms[over]
+                    current = origin + (
+                        flat * scale.unsqueeze(1)
+                    ).reshape_as(delta)
+        assert forwards == steps + 1, (forwards, steps)
         return {
             "latent": best_latent.detach(),
             "action": best_action.detach(),
             "objective": best_objective.detach(),
             "prefix_mse": best_prefix.detach(),
-            "forward_calls": steps + 1,
+            "forward_calls": forwards,
             "backward_calls": steps,
-            "sample_forward_evaluations": b * (steps + 1),
+            "sample_forward_evaluations": b * forwards,
         }
     finally:
         if was_training:

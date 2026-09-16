@@ -70,10 +70,23 @@ def _records_to_batch(records, ids, device, need_perturbed):
     return batch
 
 
-def _new_student(device):
+def _arch(config, payload=None):
+    """Item 25: width always from config; a checkpoint's recorded arch
+    must match it, so a bare make_student() default can never silently
+    mismatch a non-default config."""
+    width = int(config.get("width", 512))
+    if payload is not None:
+        recorded = payload.get("arch", {}).get("width", width)
+        if int(recorded) != width:
+            raise ValueError(
+                f"checkpoint arch width {recorded} != config width {width}")
+    return dict(condition_dim=514, horizon=16, action_dim=2, width=width)
+
+
+def _new_student(device, config=None, payload=None):
     from gad_reference import make_student as _make
-    student = _make()
-    return student.to(device)
+    spec = _arch(config or {}, payload)
+    return _make(**spec).to(device)
 
 
 def cmd_warm(args, config, device):
@@ -82,7 +95,7 @@ def cmd_warm(args, config, device):
     histories = verified["histories"]
     if not histories:
         raise ValueError("history cache holds no histories")
-    student = _new_student(device)
+    student = _new_student(device, config)
     torch.manual_seed(int(args.seed))
     optimizer = torch.optim.AdamW(student.parameters(),
                                   lr=config["learning_rate"],
@@ -101,8 +114,11 @@ def cmd_warm(args, config, device):
         cond = torch.from_numpy(
             np.stack([np.asarray(histories[i]["condition"],
                                  dtype=np.float32) for i in ids])).to(device)
+        # Item 4: train on the stored generating latent, never fresh noise
+        # against a stored endpoint (which would teach noise-independence).
         noise = torch.from_numpy(
-            rng.standard_normal((batch_size, 16, 2)).astype(np.float32)).to(device)
+            np.stack([np.asarray(histories[i]["q"],
+                                 dtype=np.float32) for i in ids])).to(device)
         target = torch.from_numpy(
             np.stack([np.asarray(histories[i]["endpoint"],
                                  dtype=np.float32) for i in ids])).to(device)
@@ -128,8 +144,8 @@ def cmd_warm(args, config, device):
         if not torch.isfinite(tensor).all():
             raise ValueError("nonfinite warm parameter; refusing to save")
     payload = dict(student=student.state_dict(), arm="warm", seed=args.seed,
-                   updates=updates,
-                   bank_sha256=C.sha256_file(args.history),
+                   updates=updates, arch=_arch(config),
+                   history_sha256=C.sha256_file(args.history),
                    protocol_id=None,
                    hyperparams=dict(lr=config["learning_rate"],
                                     weight_decay=config["weight_decay"],
@@ -150,6 +166,13 @@ def cmd_train(args, config, device):
     protocol_id = protocol.get("protocol_id") if protocol else None
     bank = C.verify_pair_bank(args.bank, config)
     records = bank["records"]
+    # Item 5: trainers assert train-only records; validation/diagnostic/
+    # final records must never reach an optimizer.
+    bad = sorted({str(r.get("split")) for r in records
+                  if r.get("split") != "train"})
+    if bad or not records:
+        raise C.ProtocolError(
+            f"train consumes train-split records only; got splits {bad}")
     seed_state = torch.load(args.initial, map_location=device, weights_only=True)
     if protocol is not None:
         C.verify_student_provenance(seed_state, protocol, config,
@@ -157,7 +180,7 @@ def cmd_train(args, config, device):
     init_sha256 = C.sha256_file(args.initial)
     if not isinstance(seed_state, dict) or "student" not in seed_state:
         raise C.ProtocolError("warm init checkpoint lacks a student state dict")
-    student = _new_student(device)
+    student = _new_student(device, config, seed_state)
     student.load_state_dict(seed_state["student"])
     for tensor in student.state_dict().values():
         if not torch.isfinite(tensor).all():
@@ -190,23 +213,18 @@ def cmd_train(args, config, device):
         batch = _records_to_batch(records, ids, device,
                                   need_perturbed=args.arm != "anchor")
         optimizer.zero_grad()
-        if args.arm == "anchor":
-            # A0: duplicate the anchor input; average the two anchor losses
-            # so forward/backward counts match the two-value arms.
-            pred_a = student(batch["q"], batch["condition"])
-            loss_a = (pred_a - batch["t0"]).square().mean()
-            pred_b = student(batch["q"], batch["condition"])
-            loss_b = (pred_b - batch["t0"]).square().mean()
-            value = 0.5 * (loss_a + loss_b)
-            response = value.new_zeros(())
-        else:
-            terms = paired_loss(
-                student, batch["q"], batch["condition"], batch["u"],
-                batch["t0"], batch["t1"], float(config["rho"]),
-                mode=("gad" if args.arm == "gad" else "augmented"),
-                beta=beta)
-            value, response = terms["value"], terms["response"]
-        loss = value + beta * response
+        # Item 1: the kernel returns the differentiable objective. Rebuilding
+        # value + beta*response from detached logging outputs reaches
+        # backward() with no graph (and conflates augmented with GAD at
+        # beta=0). Detached values are for logging only.
+        terms = paired_loss(
+            student, batch["q"], batch["condition"], batch["u"],
+            batch["t0"], batch["t1"], float(config["rho"]),
+            mode=args.arm,
+            beta=beta if args.arm == "gad" else 0.0,
+        )
+        loss = terms["loss"]
+        value, response = terms["value"], terms["response"]
         if not torch.isfinite(loss):
             raise ValueError(f"nonfinite loss at update {update}")
         loss.backward()
@@ -237,6 +255,8 @@ def cmd_train(args, config, device):
     sched_hash = schedule_hash(schedule_ids, args.updates)
     payload = dict(student=student.state_dict(), arm=args.arm, seed=args.seed,
                    updates=args.updates, init_sha256=init_sha256,
+                   arch=_arch(config),
+                   pair_bank_sha256=C.sha256_file(args.bank),
                    bank_sha256=C.sha256_file(args.bank),
                    schedule_hash=sched_hash, protocol_id=protocol_id,
                    schema_version=C.SCHEMA_VERSION,

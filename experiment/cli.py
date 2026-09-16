@@ -29,11 +29,18 @@ FINAL_STAGES = ("train", "correction", "evaluate", "analyze")
 
 
 def protocol_for(args, config):
+    # Item 21: locking requirements follow the explicit run role, not a
+    # blanket stage list. Development evaluation/training with
+    # --allow-unlocked --development stays unlocked; everything else final
+    # needs the lock.
     path = getattr(args, "protocol", None)
     stage = getattr(args, "stage", None)
+    rest = list(getattr(args, "rest", []) or [])
+    development = "--development" in rest
     if stage == "lock":
         return None
-    if stage in FINAL_STAGES:
+    if stage in FINAL_STAGES and not (
+            getattr(args, "allow_unlocked", False) and development):
         if not path:
             raise ProtocolError(
                 f"{stage} is a final stage: pass --protocol "
@@ -65,41 +72,50 @@ def main(argv=None):
         config = json.load(handle)
     validate_config(config, args.config)
     protocol_for(args, config)
+    # Item 21: forward globals before the subcommand so stage parsers see
+    # the same config/protocol/unlocked options (argparse optionals are
+    # position-independent).
+    glob = ["--config", args.config]
+    if getattr(args, "protocol", None):
+        glob += ["--protocol", args.protocol]
+    elif getattr(args, "allow_unlocked", False):
+        glob += ["--allow-unlocked"]
     if args.stage == "readiness":
         import readiness
-        sys.argv = ["readiness.py"] + args.rest
+        sys.argv = ["readiness.py"] + glob + args.rest
         return readiness.main()
     if args.stage == "collect":
         import collect
-        sys.argv = ["collect.py"] + args.rest
+        # collect.py requires the "collect" subcommand; globals go first.
+        sys.argv = ["collect.py"] + glob + ["collect"] + args.rest
         return collect.main()
     if args.stage == "warm":
         import train
-        sys.argv = ["train.py", "warm"] + args.rest
+        sys.argv = ["train.py"] + glob + ["warm"] + args.rest
         return train.main()
     if args.stage == "pairs":
         import pairs
-        sys.argv = ["pairs.py", "pairs"] + args.rest
+        sys.argv = ["pairs.py"] + glob + ["pairs"] + args.rest
         return pairs.main()
     if args.stage == "train":
         import train
-        sys.argv = ["train.py", "train"] + args.rest
+        sys.argv = ["train.py"] + glob + ["train"] + args.rest
         return train.main()
     if args.stage == "geometry":
         import geometry
-        sys.argv = ["geometry.py", "geometry"] + args.rest
+        sys.argv = ["geometry.py"] + glob + ["geometry"] + args.rest
         return geometry.main()
     if args.stage == "correction":
         import correction
-        sys.argv = ["correction.py"] + args.rest
+        sys.argv = ["correction.py"] + glob + args.rest
         return correction.main()
     if args.stage == "evaluate":
         import evaluate
-        sys.argv = ["evaluate.py"] + args.rest
+        sys.argv = ["evaluate.py"] + glob + args.rest
         return evaluate.main()
     if args.stage == "lock":
         import lock
-        sys.argv = ["lock.py"] + args.rest
+        sys.argv = ["lock.py"] + glob + args.rest
         return lock.main()
     if args.stage == "analyze":
         import analyze

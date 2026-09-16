@@ -59,9 +59,16 @@ def _unit_directions(rng, count, flat_dim):
 
 def cmd_pairs(args, config, device):
     verified = C.verify_history_cache(args.history, config)
-    histories = verified["histories"]
+    histories = [h for h in verified["histories"] if h.get("split") == "train"]
+    rejected = [h for h in verified["histories"] if h.get("split") != "train"]
+    if rejected:
+        bad = sorted({str(h.get("split")) for h in rejected})
+        raise ValueError(
+            f"pair production takes train histories only; cache holds "
+            f"splits {bad} (filter inputs to train and keep validation / "
+            "diagnostic / final scenes out of training)")
     if not histories:
-        raise ValueError("history cache holds no histories")
+        raise ValueError("history cache holds no train histories")
     rho = float(config["rho"])
     if not np.isfinite(rho) or rho <= 0:
         raise ValueError(f"config rho must be positive finite, got {rho!r}")
@@ -115,6 +122,7 @@ def cmd_pairs(args, config, device):
                         "history_id": history_id,
                         "anchor_id": int(anchor),
                         "direction_id": int(direction),
+                        "split": "train",
                         "q": q.astype(np.float32),
                         "u": u.astype(np.float32),
                         "rho": float(rho),
