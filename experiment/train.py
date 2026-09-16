@@ -89,14 +89,49 @@ def _new_student(device, config=None, payload=None):
     return _make(**spec).to(device)
 
 
+def _warm_batch(histories, ids, device):
+    cond = torch.from_numpy(
+        np.stack([np.asarray(histories[i]["condition"],
+                             dtype=np.float32) for i in ids])).to(device)
+    noise = torch.from_numpy(
+        np.stack([np.asarray(histories[i]["q"],
+                             dtype=np.float32) for i in ids])).to(device)
+    target = torch.from_numpy(
+        np.stack([np.asarray(histories[i]["endpoint"],
+                             dtype=np.float32) for i in ids])).to(device)
+    return cond, noise, target
+
+
 def cmd_warm(args, config, device):
     """Anchor-only warm start from teacher histories (endpoint targets)."""
     verified = C.verify_history_cache(args.history, config)
-    histories = verified["histories"]
+    # Audit fdb59ff item 7: warm consumes TRAINING histories only.
+    # Membership is numeric (scene in the train range), not just the
+    # split string, and targets must come from the teacher collector.
+    train_scenes = set(int(s) for s in C.scene_range(config, "train"))
+    histories = [h for h in verified["histories"]
+                 if h.get("split") == "train"
+                 and int(h.get("scene", -1)) in train_scenes]
     if not histories:
-        raise ValueError("history cache holds no histories")
-    student = _new_student(device, config)
+        raise ValueError("warm needs train-split histories in train scenes")
+    hashes = {str(h.get("collector_hash")) for h in histories}
+    if len(hashes) != 1:
+        raise C.ProtocolError(
+            f"warm histories come from {len(hashes)} collectors; "
+            "a warm start needs one teacher collection")
+    try:
+        teacher_hash = C.sha256_file(config["checkpoint"])
+    except (OSError, FileNotFoundError):
+        teacher_hash = None
+    if teacher_hash is not None and hashes != {teacher_hash}:
+        raise C.ProtocolError(
+            "warm targets are not teacher-collected "
+            f"(collector {sorted(hashes)[0][:16]} != "
+            f"checkpoint {teacher_hash[:16]}); refusing to warm-start "
+            "a teacher-mimic on student-collected targets")
+    # Seed BEFORE constructing the student so init is determined.
     torch.manual_seed(int(args.seed))
+    student = _new_student(device, config)
     optimizer = torch.optim.AdamW(student.parameters(),
                                   lr=config["learning_rate"],
                                   weight_decay=config["weight_decay"])
@@ -106,26 +141,23 @@ def cmd_warm(args, config, device):
     updates = int(args.updates)
     if updates < 1:
         raise ValueError("warm updates must be >= 1")
+    # Fixed diagnostic batch: loss reduction is measured on the same
+    # records before/after, not on unrelated first/last minibatches.
+    diag_rng = np.random.default_rng(int(args.seed) + 10 ** 6)
+    diag_ids = sample_schedule(diag_rng, n, min(batch_size, n))
     student.train()
-    first_loss = None
+    with torch.no_grad():
+        cond_d, noise_d, target_d = _warm_batch(histories, diag_ids, device)
+        first_loss = float(student(noise_d, cond_d).sub(
+            target_d).square().mean().item())
     log = []
     for update in range(updates):
         ids = sample_schedule(rng, n, batch_size)
-        cond = torch.from_numpy(
-            np.stack([np.asarray(histories[i]["condition"],
-                                 dtype=np.float32) for i in ids])).to(device)
-        # Item 4: train on the stored generating latent, never fresh noise
+        # Train on the stored generating latent, never fresh noise
         # against a stored endpoint (which would teach noise-independence).
-        noise = torch.from_numpy(
-            np.stack([np.asarray(histories[i]["q"],
-                                 dtype=np.float32) for i in ids])).to(device)
-        target = torch.from_numpy(
-            np.stack([np.asarray(histories[i]["endpoint"],
-                                 dtype=np.float32) for i in ids])).to(device)
+        cond, noise, target = _warm_batch(histories, ids, device)
         pred = student(noise, cond)
         loss = (pred - target).square().mean()
-        if first_loss is None:
-            first_loss = float(loss.detach().item())
         if not torch.isfinite(loss):
             raise ValueError(f"nonfinite warm loss at update {update}")
         optimizer.zero_grad()
@@ -136,7 +168,10 @@ def cmd_warm(args, config, device):
         if update % max(1, updates // 50) == 0 or update == updates - 1:
             log.append({"update": update, "loss": float(loss.item()),
                         "grad_norm": float(grad_norm)})
-    final_loss = float(log[-1]["loss"])
+    student.eval()
+    with torch.no_grad():
+        final_loss = float(student(noise_d, cond_d).sub(
+            target_d).square().mean().item())
     if not final_loss < first_loss:
         raise ValueError(
             f"warm value loss did not decrease: {first_loss} -> {final_loss}")
@@ -146,6 +181,9 @@ def cmd_warm(args, config, device):
     payload = dict(student=student.state_dict(), arm="warm", seed=args.seed,
                    updates=updates, arch=_arch(config),
                    history_sha256=C.sha256_file(args.history),
+                   warm_scenes=sorted(train_scenes),
+                   warm_histories=len(histories),
+                   collector_hash=sorted(hashes)[0],
                    protocol_id=None,
                    hyperparams=dict(lr=config["learning_rate"],
                                     weight_decay=config["weight_decay"],
@@ -162,8 +200,27 @@ def cmd_warm(args, config, device):
 
 
 def cmd_train(args, config, device):
+    # Audit fdb59ff item 10: direct training performs full
+    # current-protocol verification and cannot override locked beta /
+    # update settings.
     protocol = C.load_protocol(args.protocol) if args.protocol else None
+    if protocol is None and not getattr(args, "allow_unlocked", False):
+        raise C.ProtocolError("train requires --protocol or --allow-unlocked")
+    if protocol is not None:
+        C.verify_current_protocol(protocol, config, args.config,
+                                  stage="train")
     protocol_id = protocol.get("protocol_id") if protocol else None
+    if protocol is not None:
+        design = protocol.get("design", {})
+        if int(args.updates) != int(design.get("updates", args.updates)):
+            raise C.ProtocolError(
+                f"--updates {args.updates} != locked "
+                f"{design.get('updates')}; refusing to train off-lock")
+        if args.arm == "gad" and args.beta is not None and float(args.beta) != float(
+                design.get("beta_selected", args.beta)):
+            raise C.ProtocolError(
+                f"--beta {args.beta} != locked "
+                f"{design.get('beta_selected')}; refusing to train off-lock")
     bank = C.verify_pair_bank(args.bank, config)
     records = bank["records"]
     # Item 5: trainers assert train-only records; validation/diagnostic/
@@ -210,8 +267,12 @@ def cmd_train(args, config, device):
     for update in range(args.updates):
         ids = sample_schedule(rng, n, batch_size)
         schedule_ids.extend(ids)
+        # Audit fdb59ff item 1: load the complete pair for every arm.
+        # The corrected anchor kernel ignores the perturbed target in
+        # its objective, but the common loss call reads u/t1
+        # unconditionally; omitting them crashed anchor with KeyError.
         batch = _records_to_batch(records, ids, device,
-                                  need_perturbed=args.arm != "anchor")
+                                  need_perturbed=True)
         optimizer.zero_grad()
         # Item 1: the kernel returns the differentiable objective. Rebuilding
         # value + beta*response from detached logging outputs reaches
@@ -291,6 +352,7 @@ def main():
     entry.add_argument("--output", required=True)
     entry.add_argument("--seed", type=int, default=0)
     entry.add_argument("--updates", type=int, default=None)
+    entry.add_argument("--development", action="store_true")
     entry = sub.add_parser("train")
     entry.add_argument("--bank", required=True)
     entry.add_argument("--initial", required=True)
@@ -300,6 +362,7 @@ def main():
     entry.add_argument("--seed", type=int, default=0)
     entry.add_argument("--updates", type=int, default=None)
     entry.add_argument("--beta", type=float, default=None)
+    entry.add_argument("--development", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
     from hri_adapter import resolve_device

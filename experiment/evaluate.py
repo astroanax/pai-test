@@ -85,7 +85,7 @@ def rollout_episode(adapter, config, device, scene, source, steps,
     terminated_any = False
     truncated_any = False
     decision = 0
-    generated = issued = executed = invalid = 0
+    generated = issued = executed = invalid = raw_invalid_total = 0
     head_ms, dec_ms = [], []
     reason = "cap"
     sync = (lambda: torch.cuda.synchronize()) \
@@ -110,11 +110,17 @@ def rollout_episode(adapter, config, device, scene, source, steps,
                                    if cond.shape[0] != latent.shape[0] else cond)
             sync()
             head_ms.append((time.perf_counter() - head_start) * 1000.0)
+            # Audit fdb59ff improvement: log raw (pre-clipping)
+            # violations separately; clipping in prepare_commands can
+            # conceal raw out-of-bounds predictions.
+            raw_np = chunk.detach().cpu().numpy()[0]
+            raw_invalid = int((np.abs(raw_np) > 1.0).sum())
             prepared = adapter.prepare_commands(
-                chunk.detach().cpu().numpy()[0][:config["execute_steps"]])
+                raw_np[:config["execute_steps"]])
             # Item 12: never np.asarray() a CUDA tensor. numel() counts
             # coordinates; rows record what each count means.
             generated += int(chunk.numel())
+            raw_invalid_total += raw_invalid
             issued += len(prepared["prepared"])
             intervene = (intervene_every and decision % intervene_every == 0
                          and correct_fn is not None)
@@ -148,6 +154,7 @@ def rollout_episode(adapter, config, device, scene, source, steps,
                 decision_latency_p95_ms=float(np.quantile(dec_ms, 0.95)),
                 action_head_latency_median_ms=float(np.median(head_ms)),
                 generated=int(generated), issued=int(issued),
+                raw_invalid=int(raw_invalid_total),
                 executed=int(executed), invalid=int(invalid),
                 termination_reason=reason)
 
@@ -217,6 +224,13 @@ def cmd_evaluate(args, config, device):
         if not args.student:
             raise C.ProtocolError("student role requires --student")
         policy, payload = load_student_model(args.student, device)
+        # Audit fdb59ff item 10: final evaluation verifies final-student
+        # provenance (arm, seed, warm parent, bank, updates, beta,
+        # protocol identity). An artifact can be checksummed yet belong
+        # to the wrong experiment.
+        if protocol is not None and not args.development:
+            C.verify_student_provenance(payload, protocol, config,
+                                        args.student, role="final")
         method = str(payload.get("arm", args.role))
         checkpoint_hash = C.sha256_file(args.student)
     else:

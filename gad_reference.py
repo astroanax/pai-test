@@ -280,72 +280,93 @@ def invert_prefix(
         reg = torch.mean((candidate - origin).flatten(1) ** 2, dim=1)
         return prefix_mse + float(gamma) * reg, prefix_mse
 
-    # Item 11: exactly ONE model evaluation per iterate. The q0
-    # evaluation (no grad) seeds selection; each of the K steps evaluates
-    # once with grad, and that same output serves selection AND the
-    # backward. Reported counts are observed, not aspirational:
-    # K+1 forwards, K backwards, B*(K+1) sample evaluations.
+    # Audit fdb59ff item 3: evaluate and select over exactly
+    # q0, ..., qK. One forward per iterate (K+1 total); the first K
+    # forwards run with grad and their output serves selection AND the
+    # backward, the final qK forward is selection-only. The old loop
+    # evaluated q0 twice and never evaluated the computed qK, so K=1
+    # could not return an improved candidate.
+    def _project(point):
+        with torch.no_grad():
+            delta = point - origin
+            flat = delta.flatten(1)
+            norms = flat.norm(p=2, dim=1)
+            over = norms > trust_l2
+            if bool(over.any()):
+                scale = torch.ones_like(norms)
+                scale[over] = trust_l2 / norms[over]
+                return (origin + (flat * scale.unsqueeze(1)
+                                  ).reshape_as(delta))
+            return point
+
+    def _consider(state, best):
+        with torch.no_grad():
+            improved = state["objective"] < best["objective"]
+            if not bool(improved.any()):
+                return best
+            out = dict(best)
+            for key in ("latent", "action"):
+                idx = improved.unsqueeze(1)
+                out[key] = torch.where(
+                    idx.expand_as(best[key].flatten(1)),
+                    state[key].flatten(1),
+                    best[key].flatten(1),
+                ).reshape_as(best[key])
+            # Per-case 1-D objectives: plain elementwise selection.
+            for key in ("objective", "prefix"):
+                out[key] = torch.where(
+                    improved, state[key], best[key])
+            return out
+
     try:
         origin = initial.detach().clone()
         trust_l2 = float(trust_rms) * math.sqrt(initial[0].numel())
         forwards = 0
-        with torch.no_grad():
-            action0 = model(origin, condition.detach())
-            forwards += 1
-            objective0, prefix0 = per_case(action0, origin, origin)
-        best_latent = origin.clone()
-        best_action = action0.detach().clone()
-        best_objective = objective0.detach().clone()
-        best_prefix = prefix0.detach().clone()
+        backwards = 0
+        best = None
         current = origin.clone()
-        for _ in range(steps):
-            with torch.enable_grad():
-                candidate = current.detach().requires_grad_(True)
-                action = model(candidate, condition.detach())
-                forwards += 1
-                objective, prefix = per_case(action, candidate, origin)
-                total = torch.sum(objective)
-            with torch.no_grad():
-                improved = objective.detach() < best_objective
-                if bool(improved.any()):
-                    idx = improved.unsqueeze(1)
-                    flat_best = best_latent.flatten(1)
-                    flat_cur = candidate.detach().flatten(1)
-                    best_latent = torch.where(
-                        idx.expand_as(flat_best), flat_cur, flat_best
-                    ).reshape_as(best_latent)
-                    flat_ba = best_action.flatten(1)
-                    flat_ea = action.detach().flatten(1)
-                    best_action = torch.where(
-                        idx.expand_as(flat_ba), flat_ea, flat_ba
-                    ).reshape_as(best_action)
-                    best_objective = torch.where(
-                        improved, objective.detach(), best_objective
-                    )
-                    best_prefix = torch.where(
-                        improved, prefix.detach(), best_prefix
-                    )
-            grads = torch.autograd.grad(total, candidate)[0].detach()
-            current = candidate.detach() - float(learning_rate) * grads
-            with torch.no_grad():
-                delta = current - origin
-                flat = delta.flatten(1)
-                norms = flat.norm(p=2, dim=1)
-                over = norms > trust_l2
-                if bool(over.any()):
-                    scale = torch.ones_like(norms)
-                    scale[over] = trust_l2 / norms[over]
-                    current = origin + (
-                        flat * scale.unsqueeze(1)
-                    ).reshape_as(delta)
+        # Exactly one forward per iterate q0..qK (K+1 total). The first
+        # K forwards run with grad and double as the backward source;
+        # the qK forward is selection-only.
+        for iteration in range(steps + 1):
+            last = iteration == steps
+            if last:
+                with torch.no_grad():
+                    action = model(current, condition.detach())
+                    forwards += 1
+                    objective, prefix = per_case(
+                        action, current, origin)
+                state = {"latent": current.clone(),
+                         "action": action.detach().clone(),
+                         "objective": objective.detach().clone(),
+                         "prefix": prefix.detach().clone()}
+                best = state if best is None else _consider(state, best)
+            else:
+                with torch.enable_grad():
+                    candidate = current.detach().requires_grad_(True)
+                    action = model(candidate, condition.detach())
+                    forwards += 1
+                    objective, prefix = per_case(
+                        action, candidate, origin)
+                    total = torch.sum(objective)
+                state = {"latent": candidate.detach().clone(),
+                         "action": action.detach().clone(),
+                         "objective": objective.detach().clone(),
+                         "prefix": prefix.detach().clone()}
+                best = state if best is None else _consider(state, best)
+                grads = torch.autograd.grad(total, candidate)[0].detach()
+                backwards += 1
+                current = _project(
+                    candidate.detach() - float(learning_rate) * grads)
         assert forwards == steps + 1, (forwards, steps)
+        assert backwards == steps, (backwards, steps)
         return {
-            "latent": best_latent.detach(),
-            "action": best_action.detach(),
-            "objective": best_objective.detach(),
-            "prefix_mse": best_prefix.detach(),
+            "latent": best["latent"].detach(),
+            "action": best["action"].detach(),
+            "objective": best["objective"].detach(),
+            "prefix_mse": best["prefix"].detach(),
             "forward_calls": forwards,
-            "backward_calls": steps,
+            "backward_calls": backwards,
             "sample_forward_evaluations": b * forwards,
         }
     finally:

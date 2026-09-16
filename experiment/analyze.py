@@ -30,12 +30,13 @@ NONINF_MARGIN = 0.05
 
 
 def paired_summary(frame, method, baseline, key="mse", repeats=BOOTSTRAP_REPEATS,
-                   method_column="own_model"):
-    # Item 18: the endpoint is exactly method_column at PRIMARY_K.
-    # Oracle/random-search/transfer rows must never overwrite own-model
-    # measurements: duplicates and missing planned tuples are errors.
-    # Item 19: one aggregation/sign convention: A2 - A1 over scene means
-    # for both the point estimate and the bootstrap.
+                   method_column="own_model", expected_seeds=None,
+                   expected_cases=None):
+    # Audit fdb59ff item 11: completeness comes from a planned manifest
+    # (seeds x cases), never from observed keys alone: deleting both
+    # arms of an entire seed or case is detected. Paired rows must
+    # share target/context identity (scene equality); duplicates,
+    # missing, and extra tuples are all errors.
     sel = [r for r in frame
            if r.get("method") == method_column and r.get("K") == PRIMARY_K
            and r.get("model") in (method, baseline)]
@@ -46,22 +47,32 @@ def paired_summary(frame, method, baseline, key="mse", repeats=BOOTSTRAP_REPEATS
             raise ValueError(f"duplicate correction tuple {key_tuple}; "
                              "never deduplicate by overwriting")
         index[key_tuple] = row
-    keys = {(seed, case) for (seed, case, _) in index}
-    missing = []
-    for (seed, case) in sorted(keys):
-        for tag in (method, baseline):
-            if (seed, case, tag) not in index:
-                missing.append((seed, case, tag))
+    observed_cases = sorted({case for (_, case, _) in index})
+    observed_seeds = sorted({seed for (seed, _, _) in index})
+    seeds = list(expected_seeds) if expected_seeds is not None else observed_seeds
+    cases = list(expected_cases) if expected_cases is not None else observed_cases
+    if not seeds or not cases:
+        raise ValueError("incomplete paired evaluations: empty manifest")
+    extra = [(s, c, t) for (s, c, t) in index
+             if s not in seeds or c not in cases]
+    if extra:
+        raise ValueError(f"unexpected correction tuples {extra[:5]}; "
+                         "plan manifest mismatch")
+    missing = [(s, c, t) for s in seeds for c in cases
+               for t in (method, baseline) if (s, c, t) not in index]
     if missing:
         raise ValueError(f"MISSING_EPISODE: {len(missing)} planned "
                          f"(seed, case, arm) tuples missing, first {missing[:5]}")
-    if not keys:
-        raise ValueError("incomplete paired evaluations")
+    keys = {(s, c) for s in seeds for c in cases}
     by_scene = {}
     for (seed, case) in keys:
-        a = index[(seed, case, method)][key]
-        b = index[(seed, case, baseline)][key]
-        scene = index[(seed, case, method)].get("scene")
+        a_row, b_row = index[(seed, case, method)], index[(seed, case, baseline)]
+        if a_row.get("scene") != b_row.get("scene"):
+            raise ValueError(
+                f"paired rows differ in context: {(seed, case)} "
+                f"{a_row.get('scene')} != {b_row.get('scene')}")
+        a, b = a_row[key], b_row[key]
+        scene = a_row.get("scene")
         by_scene.setdefault(scene, []).append(a - b)
     scene_means = np.array([np.mean(v) for v in by_scene.values()])
     if len(scene_means) < 2:
@@ -86,16 +97,23 @@ def paired_summary(frame, method, baseline, key="mse", repeats=BOOTSTRAP_REPEATS
 
 
 def discordant_pairs(rows, method, baseline):
+    # Audit fdb59ff item 11: correction rows (K == PRIMARY_K) and
+    # ordinary episode logs (no K key) share one schema-agnostic path;
+    # episode identity includes the eval replicate; duplicates are
+    # errors, never silent overwrites.
     from scipy.stats import binomtest
     index = {}
     for row in rows:
-        if "success" not in row or row.get("K") != PRIMARY_K:
+        if "success" not in row:
+            continue
+        if "K" in row and row.get("K") != PRIMARY_K:
             continue
         tag = row.get("model", row.get("method"))
         if tag not in (method, baseline):
             continue
-        key = (row.get("seed"), row.get("scene"))
-        if key in index and tag in index[key]:
+        key = (row.get("seed"), row.get("scene"),
+               row.get("eval_replicate", 0))
+        if tag in index.get(key, {}):
             raise ValueError(f"duplicate success tuple {key + (tag,)}")
         index.setdefault(key, {})[tag] = row["success"]
     wins = sum(1 for v in index.values()
@@ -122,8 +140,11 @@ def noninferiority_from_episodes(rows, method, baseline,
             continue
         tag = row.get("model", row.get("method"))
         C.check_binary_success(row["success"])
-        index.setdefault((row.get("seed"), row.get("scene")), {})[tag] = int(
-            row["success"])
+        key = (row.get("seed"), row.get("scene"),
+               row.get("eval_replicate", 0))
+        if tag in index.get(key, {}):
+            raise ValueError(f"duplicate episode tuple {key + (tag,)}")
+        index.setdefault(key, {})[tag] = int(row["success"])
     keys = sorted(index)
     missing = [k for k in keys
                if method not in index[k] or baseline not in index[k]]
@@ -133,10 +154,19 @@ def noninferiority_from_episodes(rows, method, baseline,
     if not keys:
         return dict(n=0, margin=margin, noninferior=None,
                     note="no complete episode pairs supplied")
-    diffs = _np.array([index[k][method] - index[k][baseline] for k in keys])
+    # Scene-clustered bootstrap: resample scenes jointly (repeated
+    # scenes across fixed checkpoints stay together), not rows
+    # independently.
+    by_scene = {}
+    for k in keys:
+        by_scene.setdefault(k[1], []).append(index[k][method]
+                                             - index[k][baseline])
+    scene_means = _np.array([_np.mean(v) for v in by_scene.values()])
     rng = _np.random.default_rng(481)
-    draws = rng.integers(0, len(diffs), size=(repeats, len(diffs)))
-    boot = diffs[draws].mean(axis=1)
+    draws = rng.integers(0, len(scene_means),
+                         size=(repeats, len(scene_means)))
+    boot = scene_means[draws].mean(axis=1)
+    diffs = _np.array([index[k][method] - index[k][baseline] for k in keys])
     ci = _np.quantile(boot, [0.025, 0.975]).tolist()
     return dict(n=len(keys), difference=float(diffs.mean()),
                 ci95=ci, margin=margin,
@@ -149,6 +179,8 @@ def main():
     parser.add_argument("--inputs", nargs="+", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--protocol", default="runs/protocol_locked.json")
+    parser.add_argument("--allow-unlocked", action="store_true")
+    parser.add_argument("--development", action="store_true")
     parser.add_argument("--method", default=None)
     parser.add_argument("--baseline", default=None)
     args = parser.parse_args()
@@ -156,7 +188,8 @@ def main():
         config = json.load(handle)
     validate_config(config, args.config)
     protocol = load_protocol(args.protocol)
-    verify_current_protocol(protocol, config, args.config, stage="analysis")
+    # Audit fdb59ff item 5: shared stage identifier is "analyze".
+    verify_current_protocol(protocol, config, args.config, stage="analyze")
     primary = list(protocol["design"].get("primary_contrast")
                    or protocol.get("primary_contrast") or [])
     args.method = args.method or (primary[0] if primary else None)
@@ -177,7 +210,13 @@ def main():
     for row in rows:
         if "success" in row:
             C.check_binary_success(row["success"])
-    summary = paired_summary(rows, args.method, args.baseline)
+    # Seeds come from the locked manifest (a deleted planned seed is
+    # MISSING_EPISODE, not silently absent); case_ids come from the
+    # observed union across surviving seeds, so a seed deletion still
+    # leaves its cases expected.
+    summary = paired_summary(
+        rows, args.method, args.baseline,
+        expected_seeds=(protocol.get("design", {}).get("seeds") or None))
     summary.update(protocol_id=protocol.get("protocol_id"),
                    primary_K=PRIMARY_K,
                    discordant=discordant_pairs(rows, args.method,

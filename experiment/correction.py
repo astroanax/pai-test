@@ -176,7 +176,8 @@ def invalid_action_count(normalized_prefix, stats):
 
 
 def correct_case(case, models, teacher_outs, lr, shared_offsets, device,
-                 protocol_id, stats, gamma=GAMMA, trust_r=TRUST_R):
+                 protocol_id, stats, gamma=GAMMA, trust_r=TRUST_R,
+                 budgets=None):
     # Item 8: no-correction evaluates model(q0); random search adds SHARED
     # offsets to this case's q0 (all inside the trust ball); validity is
     # judged on denormalized actions; oracle displacement is action-space.
@@ -197,7 +198,12 @@ def correct_case(case, models, teacher_outs, lr, shared_offsets, device,
                 protocol_id=protocol_id)
     err0, act0 = model_prefix_mse(model, case["q0_np"], cond_t, target_np,
                                   device)
-    for K in K_GRID:
+    # Audit fdb59ff item 12: one budget list everywhere. Configured
+    # budgets (not the module K_GRID constant) drive student rows, so
+    # nondefault settings cannot produce missing-key failures or
+    # incorrect metadata.
+    grid = tuple(budgets) if budgets is not None else K_GRID
+    for K in grid:
         row_base = dict(base, K=K)
         rows.append(dict(row_base, method="no_correction", mse=err0,
                          displacement=0.0, displacement_kind="action",
@@ -223,10 +229,14 @@ def correct_case(case, models, teacher_outs, lr, shared_offsets, device,
                          forwards=int(out["forward_calls"]),
                          backwards=int(out["backward_calls"]),
                          latency_ms=latency))
-        t_out = teacher_outs[(case["case_id"], K)]
+        t_out = teacher_outs[(case["context_id"], case["target_id"], K)]
         transferred = t_out["latent"].cpu().numpy()
+        sync()
+        _t0 = time.perf_counter()
         transfer_mse, transfer_act = model_prefix_mse(
             model, transferred, cond_t, target_np, device)
+        sync()
+        transfer_latency = (time.perf_counter() - _t0) * 1000.0
         rows.append(dict(row_base, method="teacher_transfer",
                          mse=transfer_mse,
                          displacement=float(
@@ -235,9 +245,11 @@ def correct_case(case, models, teacher_outs, lr, shared_offsets, device,
                          displacement_kind="latent_rms",
                          invalid=invalid_action_count(
                              transfer_act[:, :target_np.shape[1]], stats),
-                         forwards=int(t_out["forward_calls"]),
-                         backwards=0, latency_ms=0.0))
+                         forwards=int(t_out["forward_calls"]) + 1,
+                         backwards=0, latency_ms=transfer_latency))
         best_mse, best_disp, best_invalid = err0, 0.0, rows[-3]["invalid"]
+        sync()
+        _r0 = time.perf_counter()
         for offset in shared_offsets:
             cand = case["q0_np"] + offset
             mse, act = model_prefix_mse(model, cand, cond_t, target_np,
@@ -248,17 +260,24 @@ def correct_case(case, models, teacher_outs, lr, shared_offsets, device,
                                   / np.sqrt(offset.size))
                 best_invalid = invalid_action_count(
                     act[:, :target_np.shape[1]], stats)
+        sync()
+        search_latency = (time.perf_counter() - _r0) * 1000.0
         rows.append(dict(row_base, method="random_search",
                          mse=best_mse, displacement=best_disp,
                          displacement_kind="latent_rms",
                          invalid=best_invalid,
                          forwards=len(shared_offsets), backwards=0,
-                         latency_ms=0.0))
+                         latency_ms=search_latency))
+        # Audit fdb59ff item 12: oracle displacement is action-space
+        # (target prefix vs the no-correction baseline action prefix).
+        # The old code subtracted a latent q0 prefix from an action
+        # target: mismatched spaces.
+        oracle_disp = float(np.linalg.norm(
+            (target_np - act0[:, :target_np.shape[1]]
+             ).ravel()) / np.sqrt(target_np.size))
         rows.append(dict(row_base, method="oracle_prefix",
                          mse=0.0,
-                         displacement=float(np.linalg.norm(
-                             (target_np - case["q0_np"][:, :target_np.shape[1]]
-                              ).ravel()) / np.sqrt(target_np.size)),
+                         displacement=oracle_disp,
                          displacement_kind="action",
                          invalid=0, forwards=0, backwards=0, latency_ms=0.0))
     return rows
@@ -269,6 +288,8 @@ def main():
     parser.add_argument("--config", default="experiment/config.json")
     parser.add_argument("--device", default=None)
     parser.add_argument("--protocol", default=None)
+    parser.add_argument("--allow-unlocked", action="store_true")
+    parser.add_argument("--development", action="store_true")
     parser.add_argument("--cases", required=True)
     parser.add_argument("--students", required=True,
                         help="JSON {model_name: checkpoint_path}")
@@ -286,22 +307,50 @@ def main():
     device = resolve_device(args.device or config["device"])
     with open(args.cases) as handle:
         raw_cases = [json.loads(line) for line in handle if line.strip()]
-    with open(args.students) as handle:
-        student_paths = json.load(handle)
-    models = {name: load_student_model(path, device)
-              for name, path in student_paths.items()}
-    teacher = build_teacher(config, device)
-    # Item 9: one validated schema. Required: case_id, context_id,
-    # target_id, scene, seed, model, checkpoint, target_origin, q0 [1,16,2],
-    # target [1,P,2], condition [514]. Batch dims added at load.
-    cases = []
+    # Audit fdb59ff item 4: validate + normalize cases BEFORE loading
+    # any model. Shapes accepted unbatched or batched and normalized
+    # to q0 [1,16,2], target [1,P,2], condition [1,514]. split and
+    # checkpoint identity are retained (never dropped).
+    def _norm_q0(value, case_id):
+        arr = np.asarray(value, dtype=np.float64)
+        if arr.shape == (16, 2):
+            arr = arr.reshape(1, 16, 2)
+        if arr.shape != (1, 16, 2):
+            raise C.ProtocolError(
+                f"case {case_id}: q0 must be [16,2] or [1,16,2]; "
+                f"got {arr.shape}")
+        return arr
+
+    def _norm_target(value, case_id):
+        arr = np.asarray(value, dtype=np.float64)
+        if arr.ndim == 2 and arr.shape[1] == 2 and 0 < arr.shape[0] <= 16:
+            arr = arr.reshape(1, arr.shape[0], 2)
+        if not (arr.ndim == 3 and arr.shape[0] == 1
+                and arr.shape[2] == 2 and 0 < arr.shape[1] <= 16):
+            raise C.ProtocolError(
+                f"case {case_id}: target must be [P,2] or [1,P,2] "
+                f"with 0 < P <= 16; got {arr.shape}")
+        return arr
+
+    def _norm_cond(value, case_id):
+        arr = np.asarray(value, dtype=np.float64)
+        if arr.shape == (514,):
+            arr = arr.reshape(1, 514)
+        if arr.shape != (1, 514):
+            raise C.ProtocolError(
+                f"case {case_id}: condition must be [514] or [1,514]; "
+                f"got {arr.shape}")
+        return arr
+
+    staged = []
     for raw in raw_cases:
         if raw.get("unreachable"):
             for key in ("case_id", "context_id", "target_id", "model"):
                 if key not in raw:
                     raise C.ProtocolError(
                         f"unreachable case missing {key}")
-            cases.append(dict(raw, unreachable=True))
+            staged.append(dict(raw, unreachable=True,
+                               split=str(raw.get("split", "eval"))))
             continue
         missing = [k for k in ("case_id", "context_id", "target_id",
                                "scene", "seed", "model", "checkpoint",
@@ -309,26 +358,45 @@ def main():
                    if k not in raw]
         if missing:
             raise C.ProtocolError(f"correction case missing {missing}")
-        q0 = np.asarray(raw["q0"], dtype=np.float64)
-        target = np.asarray(raw["target"], dtype=np.float64)
-        if q0.shape != (1, 16, 2) or target.ndim != 3 \
-                or target.shape[0] != 1 or target.shape[2] != 2 \
-                or not 0 < target.shape[1] <= 16:
+        case_id = str(raw["case_id"])
+        q0 = _norm_q0(raw["q0"], case_id)
+        target = _norm_target(raw["target"], case_id)
+        cond = _norm_cond(raw["condition"], case_id)
+        checkpoint = str(raw["checkpoint"])
+        if not os.path.exists(checkpoint):
             raise C.ProtocolError(
-                f"case {raw.get('case_id')}: q0 must be [1,16,2], target "
-                f"[1,P<=16,2]; got {q0.shape}, {target.shape}")
-        if raw["model"] not in models:
-            raise ValueError(f"case model {raw['model']!r} has no checkpoint")
-        cases.append(dict(
-            case_id=str(raw["case_id"]), context_id=str(raw["context_id"]),
+                f"case {case_id}: checkpoint missing: {checkpoint}")
+        staged.append(dict(
+            case_id=case_id, context_id=str(raw["context_id"]),
             target_id=str(raw["target_id"]),
             target_origin=str(raw["target_origin"]),
+            split=str(raw.get("split", "eval")),
             scene=int(raw["scene"]), seed=int(raw["seed"]),
-            model=str(raw["model"]),
-            q0_np=q0, target_np=target,
-            q0_t=as_tensor(raw["q0"], device, "q0"),
-            cond_t=as_tensor(raw["condition"], device, "condition"),
-            target_t=as_tensor(raw["target"], device, "target")))
+            model=str(raw["model"]), checkpoint=checkpoint,
+            checkpoint_sha256=C.sha256_file(checkpoint),
+            q0_np=q0, target_np=target, cond_np=cond,
+            q0_t=as_tensor(q0, device, "q0"),
+            cond_t=as_tensor(cond, device, "condition"),
+            target_t=as_tensor(target, device, "target")))
+    with open(args.students) as handle:
+        student_paths = json.load(handle)
+    models = {name: load_student_model(path, device)
+              for name, path in student_paths.items()}
+    teacher = build_teacher(config, device)
+    cases = []
+    for case in staged:
+        if case.get("unreachable"):
+            cases.append(case)
+            continue
+        if case["model"] not in models:
+            raise ValueError(
+                f"case model {case['model']!r} has no checkpoint")
+        if case["checkpoint"] != student_paths.get(case["model"]):
+            raise C.ProtocolError(
+                f"case {case['case_id']}: checkpoint "
+                f"{case['checkpoint']!r} does not match the loaded "
+                f"model file for {case['model']!r}")
+        cases.append(case)
     # Item 25: reserve BOTH outputs before any work; on failure mark
     # both, so no dangling meta survives a failed run.
     meta_path = args.output.replace(".jsonl", ".meta.json")
@@ -362,15 +430,38 @@ def main():
         rng = np.random.default_rng(C.stable_seed("correction", 0, 0, 0, 0))
         shared_offsets = random_search_offsets(
             rng, (1, 16, 2), n=64, trust_r=trust_r)
-        # Item 11: teacher edits computed ONCE per (case, K), reused
-        # across every student of that case.
+        # Audit fdb59ff items 4, 12: teacher edits computed ONCE per
+        # (context, target, K) over EVAL cases only (tuning cases
+        # excluded). Arm-specific cases sharing a (context, target)
+        # must carry identical q0/condition/target; otherwise they get
+        # separate keys instead of silently overwriting each other.
         teacher_outs = {}
         for case in eval_cases:
+            if case.get("split") == "tune":
+                continue
+            key_seed = (case["context_id"], case["target_id"])
             for budget in budgets:
-                teacher_outs[(case["case_id"], budget)] = invert_prefix(
+                key = (case["context_id"], case["target_id"], budget)
+                if key in teacher_outs:
+                    prior = teacher_outs[key]["_identity"]
+                    now = (case["q0_t"].detach().cpu().numpy().tobytes(),
+                           case["cond_t"].detach().cpu().numpy().tobytes(),
+                           case["target_t"].detach().cpu().numpy().tobytes())
+                    if prior != now:
+                        raise C.ProtocolError(
+                            f"cases sharing {(key_seed, budget)} disagree "
+                            "on q0/condition/target; refusing to share "
+                            "one teacher edit")
+                    continue
+                out = invert_prefix(
                     teacher, case["q0_t"], case["cond_t"], case["target_t"],
                     steps=budget, learning_rate=chosen, trust_rms=trust_r,
                     gamma=gamma)
+                out["_identity"] = (
+                    case["q0_t"].detach().cpu().numpy().tobytes(),
+                    case["cond_t"].detach().cpu().numpy().tobytes(),
+                    case["target_t"].detach().cpu().numpy().tobytes())
+                teacher_outs[key] = out
         rows, unreachable = [], 0
         for case in cases:
             if case.get("unreachable"):
@@ -392,7 +483,7 @@ def main():
             rows.extend(correct_case(case, models, teacher_outs, chosen,
                                      shared_offsets, device, protocol_id,
                                      teacher.adapter.stats, gamma=gamma,
-                                     trust_r=trust_r))
+                                     trust_r=trust_r, budgets=budgets))
         return rows, unreachable, chosen
     try:
         rows, unreachable, lr_used = _run()

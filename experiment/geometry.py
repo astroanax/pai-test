@@ -61,6 +61,43 @@ def _cosine(a, b):
     return float(np.dot(a.ravel(), b.ravel()) / denom)
 
 
+def jvp_spot_check(adapter, cond_t, spot_q, spot_dir, teacher_steps,
+                   source, tol=5e-2):
+    """Genuine JVP of the differentiable teacher endpoint map.
+
+    Uses torch.autograd.functional.jvp (forward-mode) along the unit
+    direction, compared against a central difference. The old code took
+    a VJP with grad_outputs=u and multiplied elementwise by u, i.e.
+    u*(J'u), which is not Ju (audit fdb59ff item 2: identity map gave
+    (0.36, 0.64) instead of (0.6, 0.8)).
+    """
+    import torch
+    from gad_reference import teacher_endpoint as _teacher_endpoint
+    field, cond = adapter.field, cond_t.detach()
+    base = spot_q.detach()
+    direction = spot_dir.detach()
+    eps = 1e-3
+    with torch.no_grad():
+        t_plus = adapter.teacher_action(base + eps * direction, cond,
+                                        teacher_steps, source=source)
+        t_minus = adapter.teacher_action(base - eps * direction, cond,
+                                         teacher_steps, source=source)
+    fd_deriv = ((t_plus - t_minus) / (2 * eps)).cpu().numpy().ravel()
+    with torch.enable_grad():
+        inp = base.clone().requires_grad_(True)
+        func = lambda x: _teacher_endpoint(  # noqa: E731
+            field, x, cond, teacher_steps, source=source)
+        _, jvp_out = torch.autograd.functional.jvp(
+            func, inp, direction, create_graph=False)
+    jvp = jvp_out.detach().cpu().numpy().ravel()
+    denom = max(float(np.abs(jvp).max()), 1e-12)
+    gap = float(np.abs(fd_deriv - jvp).max() / denom)
+    if not np.isfinite(gap) or gap > tol:
+        raise ValueError(
+            f"autodiff-vs-FD JVP mismatch (relative {gap})")
+    return gap
+
+
 def cmd_geometry(args, config, device):
     bank = C.verify_pair_bank(args.bank, config)
     records = bank["records"]
@@ -92,6 +129,23 @@ def cmd_geometry(args, config, device):
     teacher_steps = int(config["teacher_steps"])
     source = config["canonical_source"]
     n_prefix = int(config["execute_steps"]) * 2
+    # Audit fdb59ff item 2: validate the derivative machinery BEFORE
+    # the expensive sweep, on the actual teacher.
+    _spot = heldout_histories[0]
+    _spot_cond = torch.from_numpy(
+        np.asarray(_spot["condition"], dtype=np.float32)).unsqueeze(0).to(device)
+    _spot_q = torch.from_numpy(
+        np.random.default_rng(stable_seed("geometry", 50000, 0, 0, 0)
+                              ).standard_normal((1, 16, 2)
+                                                ).astype(np.float32)).to(device)
+    _spot_dir = torch.from_numpy(
+        np.random.default_rng(stable_seed("geometry", 50000, 0, 0, 1)
+                              ).standard_normal((1, 16, 2)
+                                                ).astype(np.float32)).to(device)
+    _spot_dir = (_spot_dir / _spot_dir.flatten(1).norm(p=2, dim=1)
+                 .reshape(-1, 1, 1))
+    spot_gap = jvp_spot_check(adapter, _spot_cond, _spot_q, _spot_dir,
+                              teacher_steps, source)
     # tau floor from median train teacher-response norm
     train_norms = []
     for record in records:
@@ -247,46 +301,6 @@ def cmd_geometry(args, config, device):
             bucket[key] /= n
         bucket["cosine"] = (bucket["cosine"] / max(bucket["cosine_n"], 1)
                             if bucket["cosine_n"] else None)
-    # central-difference spot check vs full-map teacher JVP on a subset:
-    # fresh latent from a reserved key (never a stored action chunk).
-    spot = heldout_histories[0]
-    spot_cond = torch.from_numpy(
-        np.asarray(spot["condition"], dtype=np.float32)).unsqueeze(0).to(device)
-    spot_q = torch.from_numpy(
-        np.random.default_rng(stable_seed("geometry", 50000, 0, 0, 0)
-                              ).standard_normal((1, 16, 2)
-                                                ).astype(np.float32)).to(device)
-    spot_dir = torch.from_numpy(
-        np.random.default_rng(stable_seed("geometry", 50000, 0, 0, 1)
-                              ).standard_normal((1, 16, 2)
-                                                ).astype(np.float32)).to(device)
-    spot_dir = spot_dir / spot_dir.flatten(1).norm(p=2, dim=1).reshape(-1, 1, 1)
-    eps = 1e-3
-    with torch.no_grad():
-        t_plus = adapter.teacher_action(spot_q + eps * spot_dir, spot_cond,
-                                        teacher_steps, source=source)
-        t_minus = adapter.teacher_action(spot_q - eps * spot_dir, spot_cond,
-                                         teacher_steps, source=source)
-        t_base = adapter.teacher_action(spot_q, spot_cond, teacher_steps,
-                                        source=source)
-    fd_deriv = ((t_plus - t_minus) / (2 * eps)).cpu().numpy().ravel()
-    # Item 16: genuine autodiff-vs-FD comparison, not a nondegeneracy
-    # assertion. JVP of the teacher endpoint map along spot_dir via
-    # autograd, compared against the central difference.
-    from gad_reference import teacher_endpoint as _teacher_endpoint
-    with torch.enable_grad():
-        vq = spot_q.detach().requires_grad_(True)
-        vout = _teacher_endpoint(adapter.field, vq, spot_cond.detach(),
-                                 teacher_steps, source=source)
-        (grad,) = torch.autograd.grad(
-            vout, vq,
-            grad_outputs=spot_dir.expand_as(vout).detach())
-    jvp = (grad.detach() * spot_dir.detach()).cpu().numpy().ravel()
-    denom = max(float(np.abs(jvp).max()), 1e-12)
-    spot_gap = float(np.abs(fd_deriv - jvp).max() / denom)
-    if not np.isfinite(spot_gap) or spot_gap > 5e-2:
-        raise ValueError(
-            f"autodiff-vs-FD JVP mismatch (relative {spot_gap})")
     result = dict(schema_version=C.SCHEMA_VERSION, overall=overall,
                   per_scene={str(s): v for s, v in scene_means.items()},
                   per_radius={str(k): v for k, v in per_radius.items()},
@@ -307,6 +321,8 @@ def main():
     parser.add_argument("--config", default="experiment/config.json")
     parser.add_argument("--device", default=None)
     parser.add_argument("--protocol", default=None)
+    parser.add_argument("--allow-unlocked", action="store_true")
+    parser.add_argument("--development", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
     entry = sub.add_parser("geometry")
     entry.add_argument("--bank", required=True)
@@ -318,20 +334,22 @@ def main():
     config = load_config(args.config)
     from hri_adapter import resolve_device
     device = resolve_device(args.device or config["device"])
-    # Item 15: reservation, writing, and completion lists agree: the
-    # report meta sidecar is written by cmd_geometry via write_meta.
-    C.reserve_outputs([args.output, args.predictions,
-                       args.output + ".meta.json"])
+    # Audit fdb59ff item 5: reservation, writing, and completion
+    # lists agree. cmd_geometry writes exactly two files (report JSON
+    # via write_meta + predictions npz); the phantom output.meta.json
+    # reservation/completion (never written) is removed.
+    C.reserve_outputs([args.output, args.predictions])
     try:
         if args.command == "geometry":
             cmd_geometry(args, config, device)
     except Exception as error:
         C.mark_incomplete(args.output, f"{type(error).__name__}: {error}")
+        C.mark_incomplete(args.predictions,
+                          f"{type(error).__name__}: {error}")
         raise
     else:
         C.complete_output(args.output)
         C.complete_output(args.predictions)
-        C.complete_output(args.output + ".meta.json")
     return 0
 
 

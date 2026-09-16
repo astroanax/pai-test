@@ -137,6 +137,10 @@ def check_history_pair_roundtrip(config, tmpdir):
                     condition=rng.standard_normal(514).tolist(),
                     teacher_steps=int(config["teacher_steps"]))
                for i in range(4)]
+    # Audit fdb59ff item 6: fixture metadata initialized before use.
+    meta = dict(member_keys=[[f"train-20000-{i}", 0, 0] for i in range(4)],
+                rho=float(config["rho"]), source="gaussian",
+                teacher_steps=int(config["teacher_steps"]))
     leaked = [dict(records[0], split="validation")]
     try:
         C.write_pair_bank(os.path.join(tmpdir, "bank_leak.json"), leaked,
@@ -145,9 +149,6 @@ def check_history_pair_roundtrip(config, tmpdir):
         pass
     else:
         raise AssertionError("non-train pair record accepted")
-    meta = dict(member_keys=[[f"train-20000-{i}", 0, 0] for i in range(4)],
-                rho=float(config["rho"]), source="gaussian",
-                teacher_steps=int(config["teacher_steps"]))
     bank = os.path.join(tmpdir, "bank.json")
     C.write_pair_bank(bank, records, meta, config, lineage={"test": True})
     verified_bank = C.verify_pair_bank(bank, config)
@@ -271,8 +272,30 @@ def check_torch():
     ten = R.invert_prefix(frozen, init, cond, tgt, steps=10)
     assert ten["forward_calls"] == 11, ten["forward_calls"]
     assert ten["backward_calls"] == 10, ten["backward_calls"]
-    assert float(ten["solved_objective"].mean()) <= float(
-        ten["zero_objective"].mean())
+    # Audit fdb59ff item 6: the kernel returns "objective"; compare
+    # the solved objective against the q0 objective.
+    assert float(ten["objective"].mean()) <= float(zero["objective"].mean())
+    # Audit fdb59ff item 3: one gradient step must actually improve a
+    # simple reachable target (call counts alone cannot catch the
+    # discarded-final-step bug).
+    lin = torch.nn.Linear(32, 16, bias=False)
+    with torch.no_grad():
+        lin.weight.fill_(1.0 / 32.0)
+    class _LinMap(torch.nn.Module):
+        def forward(self, lat, c):
+            return lin(lat.reshape(lat.shape[0], -1)).reshape(
+                lat.shape[0], 8, 2)
+    linmap = _LinMap().eval()
+    q_init = torch.zeros(1, 16, 2)
+    c0 = torch.zeros(1, 514)
+    with torch.no_grad():
+        t_reach = linmap(torch.full((1, 16, 2), 0.2), c0)
+    one = R.invert_prefix(linmap, q_init, c0, t_reach, steps=1,
+                          learning_rate=0.5, trust_rms=2.0, gamma=0.0)
+    assert one["forward_calls"] == 2 and one["backward_calls"] == 1
+    assert float(one["objective"].mean()) < float(
+        R.invert_prefix(linmap, q_init, c0, t_reach, steps=0)[
+            "objective"].mean())
     # Item 15: geometry spot seeds live outside the bank/schedule space.
     assert R.stable_seed("geometry", 50000, 0, 0, 0) != R.stable_seed(
         "pairs", 20000, 0, 0, 0)

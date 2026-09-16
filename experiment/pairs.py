@@ -58,15 +58,17 @@ def _unit_directions(rng, count, flat_dim):
 
 
 def cmd_pairs(args, config, device):
+    # Audit fdb59ff item 8: pair production SELECTS training histories
+    # from a verified mixed cache (the collector's default product)
+    # and records exactly which members were selected, instead of
+    # rejecting the whole cache when any validation history is present.
     verified = C.verify_history_cache(args.history, config)
-    histories = [h for h in verified["histories"] if h.get("split") == "train"]
-    rejected = [h for h in verified["histories"] if h.get("split") != "train"]
-    if rejected:
-        bad = sorted({str(h.get("split")) for h in rejected})
-        raise ValueError(
-            f"pair production takes train histories only; cache holds "
-            f"splits {bad} (filter inputs to train and keep validation / "
-            "diagnostic / final scenes out of training)")
+    train_scenes = set(int(s) for s in C.scene_range(config, "train"))
+    histories = [h for h in verified["histories"]
+                 if h.get("split") == "train"
+                 and int(h.get("scene", -1)) in train_scenes]
+    rejected = [h.get("history_id") for h in verified["histories"]
+                if h not in histories]
     if not histories:
         raise ValueError("history cache holds no train histories")
     rho = float(config["rho"])
@@ -145,6 +147,9 @@ def cmd_pairs(args, config, device):
     lineage = dict(source_hashes=C.source_hashes(),
                    parent_history=args.history,
                    parent_history_sha256=C.sha256_file(args.history),
+                   selected_histories=[str(h.get("history_id"))
+                                       for h in histories],
+                   rejected_histories=[str(h) for h in rejected],
                    collector="pairs",
                    package_versions=C.package_versions())
     C.write_pair_bank(args.output, records, meta, config, lineage)
@@ -160,6 +165,7 @@ def main():
     parser.add_argument("--device", default=None)
     parser.add_argument("--protocol", default=None)
     parser.add_argument("--allow-unlocked", action="store_true")
+    parser.add_argument("--development", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
     entry = sub.add_parser("pairs")
     entry.add_argument("--history", required=True)

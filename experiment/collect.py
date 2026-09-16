@@ -164,6 +164,7 @@ def main():
     parser.add_argument("--device", default=None)
     parser.add_argument("--protocol", default=None)
     parser.add_argument("--allow-unlocked", action="store_true")
+    parser.add_argument("--development", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
     entry = sub.add_parser("collect")
     entry.add_argument("--output", required=True)

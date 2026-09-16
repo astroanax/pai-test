@@ -503,7 +503,10 @@ def verify_history_cache(path, config, repository=None):
         missing = [k for k in HISTORY_CONTEXT_KEYS if k not in context]
         if missing:
             raise ProtocolError(f"history context missing keys {missing}")
-        for key in ("condition", "endpoint"):
+        # Audit fdb59ff item 6: the generating latent q is a numeric
+        # array like condition/endpoint (warm trains on it); convert
+        # and validate it in the reader, not just at write time.
+        for key in ("condition", "endpoint", "q"):
             context[key] = _as_float_array(context[key], key)
         context["history"] = [list(map(float, row))
                               for row in context["history"]]
@@ -659,13 +662,34 @@ def verify_current_protocol(protocol, config, config_path, repository=None,
     if stage is not None and stage not in ALLOWED_STAGES:
         raise ProtocolError(
             f"unknown stage {stage!r}; expected one of {ALLOWED_STAGES}")
+    # Audit fdb59ff item 10: enforce the lock inside every stage.
+    # Missing artifacts are errors (never skipped); JSON artifacts need
+    # their completion sidecar too (self-describing content is not
+    # completion evidence); the upstream revision is compared to the
+    # locked revision, not merely reported.
     for key in ("artifacts",):
-        for entry in (protocol.get(key) or {}).values():
+        for name, entry in (protocol.get(key) or {}).items():
             ref = entry if isinstance(entry, str) else entry.get("path", entry)
-            if isinstance(ref, str) and os.path.exists(ref):
-                verify_completed(ref)
+            if not isinstance(ref, str):
+                continue
+            if not os.path.exists(ref):
+                raise ProtocolError(
+                    f"PROTOCOL_MISMATCH: locked artifact {name} missing: "
+                    f"{ref}")
+            verify_completed(ref)
+            if ref.endswith(".json") and not os.path.exists(
+                    ref + COMPLETION_SUFFIX):
+                raise ProtocolError(
+                    f"MISSING_HASH: no completion sidecar for {ref}")
+    current_upstream = upstream_commit(repository)
+    locked_upstream = protocol.get("upstream_commit")
+    if locked_upstream not in (None, "unknown") and current_upstream not in (
+            "unknown", locked_upstream):
+        raise ProtocolError(
+            f"PROTOCOL_MISMATCH: upstream {current_upstream} != locked "
+            f"{locked_upstream}")
     return {"design_id": recomputed, "stage": stage,
-            "upstream_commit": upstream_commit(repository)}
+            "upstream_commit": current_upstream}
 
 
 def verify_student_provenance(payload, protocol, config, path,
@@ -707,6 +731,21 @@ def verify_student_provenance(payload, protocol, config, path,
         if protocol is not None and payload.get("init_sha256") != \
                 design.get("warm_sha256", "absent"):
             problems.append("final student init differs from locked warm start")
+        # Audit fdb59ff item 10: update count and beta are provenance,
+        # not tuning knobs at eval time.
+        if protocol is not None and int(payload.get("updates", -1)) != int(
+                design.get("updates", payload.get("updates", -1))):
+            problems.append(
+                f"final student updates {payload.get('updates')} != "
+                f"locked {design.get('updates')}")
+        locked_beta = design.get("beta_selected")
+        got_beta = ((payload.get("hyperparams") or {}).get("beta")
+                    if isinstance(payload.get("hyperparams"), dict) else None)
+        if (protocol is not None and payload.get("arm") == "gad"
+                and locked_beta is not None and got_beta is not None
+                and float(got_beta) != float(locked_beta)):
+            problems.append(
+                f"final student beta {got_beta} != locked {locked_beta}")
     if problems:
         raise ProtocolError("checkpoint provenance mismatch for " + str(path)
                             + ": " + "; ".join(problems))
@@ -761,10 +800,11 @@ def compute_env(device="cuda"):
 # ---------------------------------------------------------------------------
 
 def check_binary_success(value):
-    outcome = int(value)
-    if outcome not in (0, 1):
+    # Audit fdb59ff improvement: reject before casting, so 0.5 can
+    # never truncate to 0 and pass.
+    if isinstance(value, bool) or value not in (0, 1):
         raise ProtocolError(f"binary success must be 0/1, got {value!r}")
-    return outcome
+    return int(value)
 
 
 def require_complete(episodes, methods, seeds, scenes):

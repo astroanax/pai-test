@@ -34,7 +34,12 @@ def main():
                              "augmented base student for the 0.30 floor")
     parser.add_argument("--warm", required=True)
     parser.add_argument("--bank", required=True)
-    parser.add_argument("--history", required=True)
+    parser.add_argument("--history", required=True,
+                        help="warm-student history cache backing the pair "
+                             "bank (warm_checkpoint -> warm_history -> bank)")
+    parser.add_argument("--teacher-history", required=True,
+                        help="teacher history cache the warm checkpoint was "
+                             "trained on (teacher_history -> warm_checkpoint)")
     parser.add_argument("--final-prefix", default="runs/final_")
     parser.add_argument("--kind", default="latent_controllability_principal",
                         help="experiment_kind tag")
@@ -91,6 +96,20 @@ def main():
                 and r.get("split") == "development"]
     if not aug_rows:
         raise ValueError("base report holds no development augmented rows")
+    # Audit fdb59ff item 13: the base report must cover the COMPLETE
+    # development set with the locked checkpoint/assets, not just any
+    # matching rows.
+    dev_scenes = set(sorted(C.scene_range(config, "development")))
+    if {int(r.get("scene", -1)) for r in aug_rows} != dev_scenes:
+        raise ValueError(
+            "base report does not cover the complete development set: "
+            f"{sorted({int(r.get('scene', -1)) for r in aug_rows})[:5]}")
+    for row in aug_rows:
+        if row.get("checkpoint_sha256") != C.sha256_file(
+                config["checkpoint"]):
+            raise ValueError(
+                "base report checkpoint differs from the locked assets; "
+                "rebuild the evaluation")
     aug = sum(int(r.get("success", 0)) for r in aug_rows) / len(aug_rows)
     if float(aug) < MIN_AUGMENTED_DEV_SUCCESS:
         raise ValueError(
@@ -99,11 +118,47 @@ def main():
     print(f"[lock] base floor: augmented dev success {aug:.3f} "
           f"over {len(aug_rows)} episodes")
 
-    for path, role in ((args.warm, None), (args.bank, None),
-                       (args.history, None)):
+    # Audit fdb59ff item 9: the dependency graph is explicit:
+    # teacher_history -> warm_checkpoint -> warm_history -> pair_bank
+    # -> final_student. One generic history hash cannot represent both
+    # histories; each edge is verified.
+    for path in (args.warm, args.bank, args.history, args.teacher_history):
         C.verify_completed(path)
+    teacher_hist = C.verify_history_cache(args.teacher_history, config)
+    warm_hist = C.verify_history_cache(args.history, config)
     bank = C.verify_pair_bank(args.bank, config)
-    C.verify_history_cache(args.history, config)
+    # Audit fdb59ff item 10: lineage/member consistency, not just a
+    # checksum: member_keys must equal the record pair_ids exactly.
+    member_keys = {tuple(k) for k in
+                   (bank.get("meta", {}).get("member_keys", []))}
+    record_keys = {tuple(r.get("pair_id")) for r in bank.get("records", [])}
+    if member_keys != record_keys:
+        raise ValueError(
+            "pair-bank lineage/member mismatch: "
+            f"{len(member_keys)} member keys vs {len(record_keys)} records")
+    import torch as _torch_lock
+    warm_payload = _torch_lock.load(args.warm, map_location="cpu",
+                                    weights_only=True)
+    teacher_hash = C.sha256_file(args.teacher_history)
+    if warm_payload.get("history_sha256") != teacher_hash:
+        raise ValueError(
+            "warm checkpoint was not trained on the locked teacher "
+            "history "
+            f"({str(warm_payload.get('history_sha256'))[:16]} != "
+            f"{teacher_hash[:16]})")
+    bank_parent = ((bank.get("lineage") or {}).get("parent_history_sha256"))
+    if bank_parent != C.sha256_file(args.history):
+        raise ValueError(
+            "pair bank was not built from the locked warm history; "
+            "rebuild the bank from --history")
+    selected = set((bank.get("lineage") or {}).get("selected_histories", []))
+    if selected:
+        known = {str(h.get("history_id")) for h in warm_hist["histories"]}
+        if not selected <= known:
+            raise ValueError(
+                "pair bank selected histories outside the locked warm "
+                "history: "
+                f"{sorted(selected - known)[:5]}")
 
     if os.path.exists(args.output):
         raise ValueError("protocol already locked: " + args.output)
@@ -135,12 +190,16 @@ def main():
         float(args.beta_selected), rho, compute, references,
         warm=args.warm, bank=args.bank, cache=args.history,
         primary_contrast=PRIMARY_CONTRAST)
+    design["teacher_history_sha256"] = teacher_hash
+    design["design_id"] = C.design_id(design)
     protocol = dict(
         protocol_id=C.design_id(design), design=design,
+        upstream_commit=C.upstream_commit(config.get("repository")),
         sources=C.source_hashes(), config_file=C.sha256_file(args.config),
         assets=C.asset_hashes(config), packages=C.package_versions(),
         artifacts={"warm": args.warm, "bank": args.bank,
                    "history": args.history,
+                   "teacher_history": args.teacher_history,
                    "readiness_report": args.readiness_report},
         readiness_report=args.readiness_report,
         experiment_kind=args.kind, final_prefix=args.final_prefix,

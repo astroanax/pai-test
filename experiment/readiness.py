@@ -65,6 +65,9 @@ def summarize(rows):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="experiment/config.json")
+    parser.add_argument("--protocol", default=None)
+    parser.add_argument("--allow-unlocked", action="store_true")
+    parser.add_argument("--development", action="store_true")
     parser.add_argument("--output", required=True)
     parser.add_argument("--scenes", type=int, default=MIN_SCENES)
     args = parser.parse_args()
@@ -94,22 +97,49 @@ def main():
                                     steps=convention["steps"],
                                     replicate=replicate, scenes=scenes,
                                     n=len(rows), per_scene=rows, **summary))
+    # Audit fdb59ff item 13: the whole predeclared gate runs on the
+    # SELECTED (canonical source/steps) convention alone — replicate
+    # completeness, coverage, validity, and success-or-score. Success
+    # from another convention can never authorize this one.
+    selected = [c for c in conventions
+                if c["source"] == config["canonical_source"]
+                and int(c["steps"]) == int(config["teacher_steps"])]
+    expected_reps = sorted(set(REPLICATES))
+    reps_present = sorted({c["replicate"] for c in selected})
+    replicate_complete = reps_present == expected_reps
+    pooled = [r for c in selected for r in c.get("per_scene", [])]
+    scenes_hit = {r["scene"] for r in pooled}
+    coverage_ok = len({r["scene"] for r in pooled if r["success"]}) >= MIN_COVERAGE_SCENES
+    complete_dev = scenes_hit == set(scenes)
+    mean_invalid = (sum(r["invalid_rate"] for r in pooled) / len(pooled)
+                    if pooled else 1.0)
+    validity_ok = mean_invalid <= 0.10
+    shared = C.readiness_gate(conventions, config["canonical_source"],
+                              int(config["teacher_steps"]))
     gate = dict(min_success=C.READINESS_MIN_SUCCESS,
                 min_score=C.READINESS_MIN_SCORE,
-                min_coverage_scenes=MIN_COVERAGE_SCENES)
+                min_coverage_scenes=MIN_COVERAGE_SCENES,
+                max_invalid_rate=0.10,
+                selected=dict(source=config["canonical_source"],
+                              steps=int(config["teacher_steps"]),
+                              replicates=expected_reps,
+                              replicate_complete=replicate_complete,
+                              scenes_complete=complete_dev,
+                              coverage_ok=coverage_ok,
+                              validity_ok=validity_ok,
+                              mean_invalid_rate=mean_invalid),
+                shared_gate=shared)
     passing = [c for c in conventions
                if c["success"] >= C.READINESS_MIN_SUCCESS
                and c["coverage_scenes"] >= MIN_COVERAGE_SCENES]
-    shared = C.readiness_gate(conventions, config["canonical_source"],
-                              int(config["teacher_steps"]))
-    passed = bool(passing) and bool(shared["passed"])
+    passed = bool(replicate_complete and complete_dev and coverage_ok
+                  and validity_ok and shared["passed"])
     report = dict(kind="teacher_readiness", schema_version=SCHEMA_VERSION,
                   config_sha256=sha256_file(args.config),
                   checkpoint_sha256=sha256_file(config["checkpoint"]),
                   source_hashes=source_hashes(),
                   package_versions=package_versions(),
                   conventions=conventions, gate=gate,
-                  shared_gate=shared,
                   passed=passed,
                   passing=[c["name"] for c in passing],
                   compute=C.compute_env(config.get("device", "cuda")))

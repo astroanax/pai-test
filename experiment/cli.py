@@ -71,7 +71,9 @@ def main(argv=None):
         import json
         config = json.load(handle)
     validate_config(config, args.config)
-    protocol_for(args, config)
+    # --help must reach the stage parser without lock gating.
+    if not any(flag in args.rest for flag in ("-h", "--help")):
+        protocol_for(args, config)
     # Item 21: forward globals before the subcommand so stage parsers see
     # the same config/protocol/unlocked options (argparse optionals are
     # position-independent).
@@ -118,8 +120,10 @@ def main(argv=None):
         sys.argv = ["lock.py"] + glob + args.rest
         return lock.main()
     if args.stage == "analyze":
+        # Audit fdb59ff item 5: analysis receives the dispatcher
+        # config/protocol arguments like every other stage.
         import analyze
-        sys.argv = ["analyze.py"] + args.rest
+        sys.argv = ["analyze.py"] + glob + args.rest
         return analyze.main()
     raise ProtocolError(f"stage {args.stage!r} has no module yet")
 

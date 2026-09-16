@@ -56,19 +56,13 @@ def numpy_checks():
     assert a == b and a != c
     assert 0 <= a < 2**63
 
-    # 7. NaN radius is rejected by the reference kernels.
+    # 7. NaN radius is rejected by the dependency-free radius
+    # validator (audit fdb59ff item 6: numpy_checks must not import
+    # torch; the torch-gated paired_loss NaN path is covered by
+    # torch_checks below).
+    from gad_reference import positive_finite as _positive_finite
     try:
-        import torch
-
-        sep = os.sep  # touch os import
-        del sep
-        student = _FakeStudent()
-        lat = torch.zeros(2, 1, 2, dtype=torch.float32)
-        cond = torch.zeros(2, 3, dtype=torch.float32)
-        direction = torch.zeros_like(lat)
-        direction[:, 0, 0] = 1.0
-        tgt = torch.zeros(2, 1, 2, dtype=torch.float32)
-        _paired_loss(student, lat, cond, direction, tgt, tgt, float("nan"))
+        _positive_finite(float("nan"), "radius")
     except ValueError:
         pass
     else:
@@ -88,6 +82,22 @@ class _FakeStudent:
 
 
 def torch_checks():
+    # NaN radius through the real kernel (torch-gated).
+    from gad_reference import paired_loss as _torch_paired_loss
+    import torch as _torch_check
+    _fake = _FakeStudent()
+    _lat = _torch_check.zeros(2, 1, 2, dtype=_torch_check.float32)
+    _cond = _torch_check.zeros(2, 3, dtype=_torch_check.float32)
+    _dir = _torch_check.zeros_like(_lat)
+    _dir[:, 0, 0] = 1.0
+    _tgt = _torch_check.zeros(2, 1, 2, dtype=_torch_check.float32)
+    try:
+        _torch_paired_loss(_fake, _lat, _cond, _dir, _tgt, _tgt,
+                           float("nan"))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("NaN radius was not rejected by paired_loss")
     import math as _math
 
     import torch
