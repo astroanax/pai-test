@@ -176,13 +176,18 @@ def run(config, device, output, modes):
     record("exact_pullback_metric", exact_metric)
 
     def replay_and_transitions():
+        import math
         results = []
         for scene in (config["development_scene_start"],
                       config["development_scene_start"] + 1):
             env = adapter.new_env(image=True)
             obs, _ = adapter.reset(env, scene)
             history = []
-            before_pose = np.asarray(adapter.signature(env))
+            before = np.asarray(adapter.signature(env))
+            # block pose only: position (x, y) plus wrapped orientation. The
+            # pusher state is deliberately excluded: pusher motion with a
+            # stationary block must NOT pass a block-motion check.
+            before_block = np.array([before[4], before[5], before[8] % (2 * math.pi)])
             for step in range(24):
                 action = np.array([256.0 + 8.0 * np.sin(step / 3.0),
                                    300.0 - 6.0 * step])
@@ -190,19 +195,25 @@ def run(config, device, output, modes):
                 history.append(action.tolist())
                 if done:
                     break
-            after_pose = np.asarray(adapter.signature(env))
+            after = np.asarray(adapter.signature(env))
+            after_block = np.array([after[4], after[5], after[8] % (2 * math.pi)])
+            orientation_gap = abs((after_block[2] - before_block[2] + math.pi) %
+                                  (2 * math.pi) - math.pi)
+            position_gap = float(np.abs(after_block[:2] - before_block[:2]).max())
+            moved = max(position_gap, orientation_gap)
             live = adapter.signature(env)
-            moved = float(np.abs(after_pose[[2, 3, 4, 5, 6, 7]] -
-                                 before_pose[[2, 3, 4, 5, 6, 7]]).max())
             env.close()
             gap = adapter.check_replay(scene, history, live)
             equiv = adapter.check_transition_equivalence(scene, history[:-1],
                                                         np.asarray([history[-1]]))
             results.append(dict(scene=scene, steps=len(history), replay_gap=gap,
+                                block_position_gap=position_gap,
+                                block_orientation_gap=float(orientation_gap),
                                 pose_change=moved, image_state_gap=equiv,
                                 block_moved=bool(moved > 1e-6)))
         assert all(r["block_moved"] for r in results), \
-            "block pose did not change in either smoke history"
+            "block pose (position or wrapped orientation) did not change in " \
+            "either smoke history; the fixture may be free-space motion"
         return results
     record("replay_and_image_state_transitions", replay_and_transitions)
 

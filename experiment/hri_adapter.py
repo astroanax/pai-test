@@ -244,7 +244,8 @@ class HRIAdapter:
         return dict(raw=raw, prepared=prepared,
                     raw_violations=raw_violations,
                     executed_violations=int(executed_invalid.sum()),
-                    clip_fraction=raw_violations / max(coordinates, 1),
+                    clip_fraction=(raw_violations / max(coordinates, 1)
+                                   if self.clip_actions else 0.0),
                     coordinates=coordinates,
                     clipped=bool(self.clip_actions))
 
@@ -271,9 +272,14 @@ class HRIAdapter:
     def replay(self, scene, history):
         env = self.new_env(image=False)
         self.reset(env, scene)
-        for action in history:
+        history = list(history)
+        for position, action in enumerate(history):
             _, _, terminated, _, _ = self.raw_step(env, np.asarray(action, dtype=np.float64))
-            if terminated:
+            # A history that ends exactly at termination is a complete fixture
+            # and must replay cleanly; only actions AFTER termination are
+            # rejected. This keeps the fixture contract and the replay contract
+            # in agreement.
+            if terminated and position < len(history) - 1:
                 env.close()
                 raise ValueError("history continues after episode termination")
         return env

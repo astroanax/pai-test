@@ -2,8 +2,9 @@ set -euo pipefail
 # Two-scene vertical integration test: exercises the ACTUAL producer/consumer
 # commands end to end on a tiny budget before committing the A100 budget.
 # Usage: bash experiment/vertical_test.sh [run_dir]
-# Requires: assets/normalizer.npz and the teacher checkpoint (step 0 builds the
-# normalizer only if --dataset is exported as RH_DATASET).
+# Requires: the teacher checkpoint plus assets/normalizer.npz already built
+# (e.g. `python experiment/pilot.py normalizer --dataset ... --output
+# assets/normalizer.npz`). This script builds nothing from RH_DATASET.
 
 RUN="${1:-runs-vertical}"
 CONFIG="${CONFIG:-experiment/config.json}"
@@ -46,7 +47,7 @@ python experiment/diagnose.py --config "${CONFIG}" --allow-unlocked \
 
 python experiment/lock_protocol.py --config "${CONFIG}" --confirm-no-final-results \
   --modes uniform pullback --seeds 0 1 --updates 5 --test-episodes 2 \
-  --min-metric-fraction 0 --final-prefix "${RUN}/final_" \
+  --min-metric-fraction 0 --min-support 0 --final-prefix "${RUN}/final_" \
   --cache "${RUN}/shared_metrics.npz" --warm "${RUN}/warm.pt" \
   --smoke-report "${RUN}/smoke_report.json" --output "${RUN}/protocol_locked.json" \
   || fail "protocol lock"
@@ -59,7 +60,7 @@ for seed in 0 1; do
       --seed "${seed}" --updates 5 --initial "${RUN}/warm.pt" || fail "train ${mode}/${seed}"
     python experiment/pilot.py --config "${CONFIG}" --protocol "${RUN}/protocol_locked.json" \
       evaluate --student "${RUN}/student_${mode}_seed${seed}.pt" --name "${mode}" \
-      --seed "${seed}" --episodes 2 --output "${RUN}/final_${mode}_seed${seed}.jsonl" \
+      --seed "${seed}" --output "${RUN}/final_${mode}_seed${seed}.jsonl" \
       || fail "evaluate ${mode}/${seed}"
   done
 done
@@ -68,17 +69,37 @@ python experiment/analyze.py --config "${CONFIG}" --protocol "${RUN}/protocol_lo
   --inputs "${RUN}"/final_*.jsonl --output "${RUN}/paired.json" \
   || fail "analysis of the complete tiny result"
 
-# negative control: a deliberately missing pair must be rejected
+# negative control, step 1: an INTACT copy (evaluations + sidecars + completion
+# records) must still pass analysis
 mkdir -p "${RUN}/negative"
 cp "${RUN}"/final_*.jsonl "${RUN}/negative/"
+cp "${RUN}"/final_*.meta.json "${RUN}/negative/"
+cp "${RUN}"/final_*.complete.json "${RUN}/negative/"
+python experiment/analyze.py --config "${CONFIG}" --protocol "${RUN}/protocol_locked.json" \
+  --inputs "${RUN}"/negative/final_*.jsonl --output "${RUN}/negative/paired_intact.json" \
+  || fail "analysis rejected an intact copy (negative-control fixture broken)"
+echo "[vertical] negative control step 1 passed: intact copy accepted"
+# step 2: remove exactly one planned episode and assert the SPECIFIC
+# missing-episode error, not merely any nonzero exit
 head -n -1 "${RUN}/negative/final_pullback_seed1.jsonl" > "${RUN}/negative/partial.jsonl" \
   && mv "${RUN}/negative/partial.jsonl" "${RUN}/negative/final_pullback_seed1.jsonl"
-cp "${RUN}"/final_*.meta.json "${RUN}/negative/" 2>/dev/null || true
+# keep the sidecar consistent with its rows so the failure lands on the
+# missing-pair check (not the sidecar/row agreement check)
+python - "${RUN}/negative/final_pullback_seed1.meta.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+meta = json.load(open(path))
+meta["scenes"] = meta["scenes"][:-1]
+json.dump(meta, open(path, "w"), indent=2)
+PY
 if python experiment/analyze.py --config "${CONFIG}" --protocol "${RUN}/protocol_locked.json" \
-    --inputs "${RUN}"/negative/final_*.jsonl --output "${RUN}/negative/paired.json" 2>/dev/null; then
+    --inputs "${RUN}"/negative/final_*.jsonl --output "${RUN}/negative/paired.json" \
+    > "${RUN}/negative/analysis_err.txt" 2>&1; then
   fail "analysis accepted a deliberately incomplete experiment"
 else
-  echo "[vertical] negative control passed: incomplete experiment rejected"
+  grep -q -E "missing|incomplete|no evaluation rows" "${RUN}/negative/analysis_err.txt" \
+    || fail "analysis rejected the partial fixture for the wrong reason: $(cat "${RUN}/negative/analysis_err.txt")"
+  echo "[vertical] negative control step 2 passed: missing episode rejected for the right reason"
 fi
 
 echo "[vertical] PASS: all producer/consumer stages ran end to end in ${RUN}"

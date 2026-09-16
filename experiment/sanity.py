@@ -116,7 +116,7 @@ def check_producer_consumer(config, tmpdir):
                 seed=0, student="warm.pt", splits={"train": 4, "validation": 2},
                 contexts=len(contexts))
     C.write_label_cache(label_path, contexts, config, meta,
-                            dict(source_hashes={}, mode="shared"))
+                            dict(source_hashes=C.source_hashes(), mode="shared"))
     verified = C.verify_label_cache(label_path, config, expect_mode="shared",
                                     allowed_scenes=C.scene_range(config, "train") |
                                     C.scene_range(config, "validation"))
@@ -152,7 +152,9 @@ def check_producer_consumer(config, tmpdir):
                                "total": len(metric_contexts)},
                        source=config["source"], splits={"train": len(metric_contexts)})
     C.write_metric_cache(metric_path, metric_contexts, config, metric_meta,
-                             dict(cache=label_path))
+                             dict(cache=label_path,
+                                  source_hashes=C.source_hashes(),
+                                  epsilon=config["finite_difference_epsilon"]))
     metric_verified = C.verify_label_cache(metric_path, config, require_metric=True)
     out["metric_cache_contexts"] = metric_verified["n_contexts"]
     drifted = dict(config)
@@ -194,7 +196,8 @@ def check_metric_subset_spread(config):
 
 
 def check_empty_metric_count():
-    """metric_count=0 must fall back to the full batch, never NaN."""
+    """metric_count=0 must yield a ZERO physical penalty, never NaN and never
+    a full-batch fallback that charges ordinary rows."""
     import torch
     from core import TwoStepStudent, objective
     torch.manual_seed(0)
@@ -206,26 +209,100 @@ def check_empty_metric_count():
         loss, parts = objective(student, batch, "prefix", 8, None,
                                 metric_count=count)
         assert torch.isfinite(loss), f"prefix with metric_count={count} is nonfinite"
-        assert torch.isfinite(parts["penalty"]), "prefix penalty is NaN"
-    return dict(empty_count_falls_back_to_full_batch=True)
+        assert float(parts["penalty"]) == 0.0, \
+            f"empty selection must carry zero penalty, got {parts['penalty']}"
+    return dict(empty_count_yields_zero_penalty=True)
 
 
-def check_warm_provenance_accepted(config):
-    """An unlocked uniform warm start must pass provenance for locked training."""
-    payload = dict(protocol_id=None, mode="uniform", seed=0, updates=6000,
-                   metric_mode=config.get("metric_mode", "exact"))
+def check_warm_provenance_roles(config, tmpdir):
+    """Item 2: a different unlocked uniform checkpoint must fail as BOTH
+    initialization and final student; only the hash-matched warm start
+    initializes locked training."""
+    import torch
+    warm_path = os.path.join(tmpdir, "warm.pt")
+    other_path = os.path.join(tmpdir, "other.pt")
+    torch.save({"x": torch.zeros(1)}, warm_path)
+    torch.save({"x": torch.ones(1)}, other_path)
+    warm_hash = C.sha256_file(warm_path)
     protocol = dict(protocol_id="pid", modes=["uniform", "pullback"],
-                    seeds=[0, 1], updates=6000, cache_sha256="other",
-                    warm_start_sha256="other")
-    assert C.verify_student_provenance(payload, protocol, config, "warm.pt") is True
-    metric_payload = dict(payload, mode="pullback")
+                    seeds=[0, 1], updates=6000, cache_sha256="c",
+                    warm_start_sha256=warm_hash)
+    warm_payload = dict(protocol_id=None, mode="uniform", seed=0, updates=6000,
+                        metric_mode=config.get("metric_mode", "exact"))
+    assert C.verify_student_provenance(warm_payload, protocol, config,
+                                       warm_path, role="init") is True
+    assert C.verify_student_provenance(warm_payload, None, config,
+                                       warm_path, role="reference") is True
+    for role in ("init", "final"):
+        try:
+            C.verify_student_provenance(warm_payload, protocol, config,
+                                        other_path, role=role)
+        except C.ProtocolError:
+            pass
+        else:
+            raise AssertionError(f"different unlocked checkpoint passed as {role}")
+    return dict(hash_matched_init_accepted=True,
+                different_checkpoint_rejected_as_init_and_final=True)
+
+
+def check_canonical_binding(config):
+    """Item 6: editing final scenes, contrast, updates, or modes without
+    regenerating the lock must fail verification."""
+    import copy
+    base_choices = C.canonical_choices(config, ["uniform", "pullback"], [0, 1],
+                                       5, None, None, None,
+                                       final_scenes=[10, 11],
+                                       primary_contrast=["pullback", "uniform"])
+    edited = copy.deepcopy(base_choices)
+    edited["final_scenes"] = [10, 12]
+    assert C.combined_id(dict(choices=base_choices)) != \
+        C.combined_id(dict(choices=edited)), "scene edit invisible to the id"
+    edited_contrast = copy.deepcopy(base_choices)
+    edited_contrast["primary_contrast"] = ["pullback", "endpoint"]
+    assert C.combined_id(dict(choices=base_choices)) != \
+        C.combined_id(dict(choices=edited_contrast)), "contrast edit invisible"
+    return dict(canonical_binds_scenes_and_contrast=True)
+
+
+def check_duplicate_episodes_rejected():
+    """Item 9: five rows for four planned episodes must fail completeness."""
+    protocol = dict(modes=["pullback", "endpoint"], seeds=[0],
+                    final_scenes=[10, 11])
+    rows = []
+    for method in ("pullback", "endpoint"):
+        for scene in (10, 11):
+            rows.append({"method": method, "training_seed": 0, "scene": scene,
+                         "success": 1})
+    rows.append({"method": "pullback", "training_seed": 0, "scene": 10,
+                 "success": 1})
     try:
-        C.verify_student_provenance(metric_payload, protocol, config, "x.pt")
+        C.require_complete(rows, protocol, "pullback", "endpoint")
+    except ValueError as error:
+        assert "duplicate" in str(error).lower(), str(error)
+    else:
+        raise AssertionError("duplicated episodes passed completeness")
+    return dict(duplicates_rejected=True)
+
+
+def check_development_eval_gate():
+    """Item 1: unlocked development evaluation is accepted; unlocked test
+    evaluation is rejected."""
+    import types
+    import pilot
+    dev = types.SimpleNamespace(protocol=None, command="evaluate",
+                                development=True, allow_unlocked=True,
+                                config="experiment/config.json")
+    assert pilot.protocol_for(dev, {}) == (None, None)
+    test = types.SimpleNamespace(protocol=None, command="evaluate",
+                                 development=False, allow_unlocked=True,
+                                 config="experiment/config.json")
+    try:
+        pilot.protocol_for(test, {})
     except C.ProtocolError:
         pass
     else:
-        raise AssertionError("unlocked metric checkpoint accepted as warm start")
-    return dict(warm_start_accepted=True, unlocked_metric_rejected=True)
+        raise AssertionError("unlocked test evaluation accepted")
+    return dict(dev_accepted_test_rejected=True)
 
 
 def check_device_key_normalization():
@@ -286,6 +363,7 @@ def check_protocol_and_analysis(config, config_path, tmpdir):
         handle.write(b"warm")
     protocol = dict(modes=["pullback", "endpoint"], seeds=[0, 1],
                     final_scenes=[10, 11], protocol_id="pid",
+                    primary_contrast=["pullback", "endpoint"],
                     source_hashes=C.source_hashes(), upstream=upstream,
                     upstream_commit=C.upstream_commit(config["repository"]),
                     packages=C.package_versions(["numpy"]),
@@ -294,6 +372,15 @@ def check_protocol_and_analysis(config, config_path, tmpdir):
                     smoke_report=smoke, smoke_report_sha256=C.sha256_file(smoke),
                     cache=cache, cache_sha256=C.sha256_file(cache),
                     warm_start=warm, warm_start_sha256=C.sha256_file(warm))
+    protocol["canonical_choices"] = C.canonical_choices(
+        config, ["pullback", "endpoint"], [0, 1], None, warm, cache, smoke,
+        final_scenes=[10, 11], primary_contrast=["pullback", "endpoint"])
+    protocol["protocol_id"] = C.combined_id(dict(
+        config=C.source_hashes(), config_file=C.sha256_file(config_path),
+        cache=protocol["cache_sha256"], warm=protocol["warm_start_sha256"],
+        smoke_report=protocol["smoke_report_sha256"], assets=protocol["assets"],
+        upstream=protocol["upstream"], upstream_commit=protocol["upstream_commit"],
+        choices=protocol["canonical_choices"], resolved=config))
     C.verify_current_protocol(protocol, config, config_path)
     protocols["fresh_lock_verified"] = True
     missing = dict(protocol)
@@ -323,7 +410,8 @@ def check_protocol_and_analysis(config, config_path, tmpdir):
         raise AssertionError("configuration drift accepted")
 
     good = [dict(method=m, training_seed=s, scene=c, success=1,
-                 protocol_id="pid", split="test", decision_latency_median_ms=1.0,
+                 protocol_id=protocol["protocol_id"], split="test",
+                 decision_latency_median_ms=1.0,
                  score=0.9, raw_violation_fraction=0.0)
             for m in ("pullback", "endpoint") for s in (0, 1) for c in (10, 11)]
     C.require_complete(good, protocol, "pullback", "endpoint")
@@ -353,7 +441,8 @@ def check_protocol_and_analysis(config, config_path, tmpdir):
             C.write_meta(jsonl.replace(".jsonl", ".meta.json"),
                          dict(kind="evaluation", intrinsic_mode=mode,
                               intrinsic_seed=seed, checkpoint_sha256="sha",
-                              protocol_id="pid", split="test", expected_split="test",
+                              protocol_id=protocol["protocol_id"],
+                              split="test", expected_split="test",
                               scenes=[10, 11]))
     inputs = [os.path.join(tmpdir, f"final_{m}_seed{s}.jsonl")
               for m in ("pullback", "endpoint") for s in (0, 1)]
@@ -383,7 +472,9 @@ def main():
     args = parser.parse_args()
     config, config_path = load_config()
     results = {"metric_subset_spread": check_metric_subset_spread(config),
-               "warm_provenance": check_warm_provenance_accepted(config),
+               "canonical_binding": check_canonical_binding(config),
+               "duplicate_episodes": check_duplicate_episodes_rejected(),
+               "development_eval_gate": check_development_eval_gate(),
                "linear_algebra": check_linear_algebra(),
                "config_validation": check_config_validation(),
                "spearman_ties": check_spearman(),
@@ -391,6 +482,8 @@ def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         results["producer_consumer"] = check_producer_consumer(config, tmpdir)
         results["reserve_and_completion"] = check_reserve_and_completion(tmpdir)
+        results["warm_provenance_roles"] = check_warm_provenance_roles(config,
+                                                                       tmpdir)
         results["protocol_and_analysis"] = check_protocol_and_analysis(
             config, config_path, tmpdir)
     try:
@@ -457,9 +550,9 @@ def check_torch(torch, TwoStepStudent, objective, pullback_metric_exact,
     clean = objective(student, batch, "prefix", 8, None, metric_count=2)[1]["penalty"]
     poisoned = dict(batch)
     poisoned["target_mid"] = batch["target_mid"].clone()
-    poisoned["target_mid"][2:] = 100.0
+    poisoned["target_mid"][:2] = 100.0
     poisoned["target_end"] = batch["target_end"].clone()
-    poisoned["target_end"][2:] = 100.0
+    poisoned["target_end"][:2] = 100.0
     dirty = objective(student, poisoned, "prefix", 8, None, metric_count=2)[1]["penalty"]
     assert torch.allclose(clean, dirty, atol=1e-6), "prefix penalty leaks the unmarked half"
     whole = objective(student, poisoned, "prefix", 8, None, metric_count=4)[1]["penalty"]

@@ -49,7 +49,11 @@ def paired_summary(frame, method, baseline, repeats=10000):
 
 
 def descriptive_table(frame, protocol):
-    """Every locked run must appear, so secondary methods cannot silently vanish."""
+    """Every locked run must appear, so secondary methods cannot silently vanish.
+
+    Declared reference measurements (teacher / native-fast) are included with
+    their measured success, score, and latencies when their files are passed.
+    """
     rows = []
     for method in protocol["modes"]:
         for seed in protocol["seeds"]:
@@ -58,11 +62,43 @@ def descriptive_table(frame, protocol):
             if subset.empty:
                 raise ValueError(f"descriptive table: locked run {method}/seed{seed} "
                                  "is missing")
-            rows.append({"method": method, "seed": int(seed), "n": int(len(subset)),
+            rows.append({"method": method, "seed": int(seed), "kind": "student",
+                         "n": int(len(subset)),
                          "success": float(subset["success"].mean()),
                          "score": float(subset["score"].mean()),
                          "latency_median_ms": float(subset["decision_latency_median_ms"].median()),
+                         "head_latency_median_ms": float(subset["action_head_latency_median_ms"].median()),
                          "raw_violation_fraction": float(subset["raw_violation_fraction"].mean())})
+    return rows
+
+
+def reference_table(frame, protocol):
+    """Measured reference runs declared in the protocol (teacher/native-fast).
+
+    References are required at their planned scenes when declared; their
+    measured success, score, and latencies enter the report as references,
+    never as arms of the primary contrast.
+    """
+    rows = []
+    for name in ("teacher", "native_fast"):
+        spec = (protocol.get("references") or {}).get(name)
+        if not spec:
+            continue
+        subset = frame[frame["method"] == spec.get("method", name)]
+        if subset.empty:
+            raise ValueError(f"declared reference {name} has no evaluation rows; "
+                             "pass its file or remove it from the lock")
+        scenes = sorted(int(s) for s in subset["scene"].unique())
+        if scenes != sorted(int(s) for s in spec.get("scenes", [])):
+            raise ValueError(f"reference {name} scenes {scenes[:5]} != "
+                             f"planned {spec.get('scenes', [])[:5]}")
+        rows.append(dict(name=name, method=spec.get("method", name),
+                         n=int(len(subset)),
+                         success=float(subset["success"].mean()),
+                         score=float(subset["score"].mean()),
+                         latency_median_ms=float(
+                             subset["decision_latency_median_ms"].median()),
+                         spec=spec))
     return rows
 
 
@@ -107,6 +143,11 @@ def main():
         if key not in frame:
             raise ValueError("evaluation rows lack " + key)
     C.check_binary_success(frame.to_dict("records"))
+    if "split" in frame and (frame["split"] != "test").any():
+        bad = sorted(frame.loc[frame["split"] != "test", "split"].unique().tolist())
+        raise ValueError("final analysis accepts only test-split rows; "
+                         f"development rows ({bad}) are labeled development "
+                         "and can never enter a final comparison")
     metadata = C.require_eval_metadata(frame, protocol, args.inputs,
                                        method=args.method)
     if metadata["missing_runs"]:
@@ -115,9 +156,17 @@ def main():
 
     summary = paired_summary(frame, args.method, args.baseline)
     summary["protocol_id"] = protocol.get("protocol_id")
+    primary = list(protocol.get("primary_contrast") or [])
+    if [args.method, args.baseline] == primary:
+        summary["contrast"] = "primary"
+    else:
+        summary["contrast"] = ("secondary: user-selected "
+                               f"{args.method} vs {args.baseline}; the registered "
+                               f"primary contrast is {primary}")
     summary["planned"] = {"modes": protocol["modes"], "seeds": protocol["seeds"],
                           "scenes": len(protocol["final_scenes"])}
     summary["descriptive"] = descriptive_table(frame, protocol)
+    summary["references"] = reference_table(frame, protocol)
     summary["reference"] = {
         "teacher_steps": protocol.get("teacher_steps"),
         "teacher_source": protocol.get("source_distribution"),

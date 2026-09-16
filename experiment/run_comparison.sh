@@ -7,21 +7,23 @@ RUN="${RUN:-runs}"
 # Stage 2 of the two-stage workflow: this runner VERIFIES artifacts the user has
 # already produced deliberately (smoke report, warm start, metric cache,
 # protocol lock). It never creates the lock and never injects the acknowledgement
-# flag on the user's behalf.
+# flag on the user's behalf. Locked paths are read from the lock FIRST, then
+# those exact artifacts are validated (hash, completion record, protocol).
 if [ ! -f "${PROTOCOL}" ]; then
   echo "no protocol lock at ${PROTOCOL}; run experiment/lock_protocol.py --confirm-no-final-results yourself" >&2
   exit 1
 fi
-for artifact in "${RUN}/smoke_report.json" "${RUN}/warm.pt" "${RUN}/shared_metrics.npz"; do
-  if [ ! -f "${artifact}" ]; then
-    echo "missing required artifact ${artifact}" >&2
-    exit 1
-  fi
-  if [ ! -f "${artifact}.complete.json" ]; then
-    echo "${artifact} has no completion record; it is partial or predates the current schema" >&2
-    exit 1
-  fi
-done
+LOCK_SMOKE="$(python -c "import json,sys;print(json.load(open(sys.argv[1]))['smoke_report'])" "${PROTOCOL}")"
+LOCK_CACHE="$(python -c "import json,sys;print(json.load(open(sys.argv[1]))['cache'])" "${PROTOCOL}")"
+LOCK_WARM="$(python -c "import json,sys;print(json.load(open(sys.argv[1]))['warm_start'])" "${PROTOCOL}")"
+python - "${LOCK_SMOKE}" "${LOCK_CACHE}" "${LOCK_WARM}" <<'PY'
+import sys
+sys.path.insert(0, "experiment")
+import contract as C
+for path in sys.argv[1:]:
+    C.verify_completed(path)
+print("locked artifacts verified:", sys.argv[1:])
+PY
 
 if ! python - "${PROTOCOL}" <<'PY'
 import json, sys
@@ -77,17 +79,17 @@ for seed in ${SEEDS}; do
   done
 done
 
-ref="${RUN}/final_reference_teacher${REF_STEPS}_${REF_SOURCE}.jsonl"
+ref="${RUN}/final_teacher.jsonl"
 if [ ! -f "${ref}.complete.json" ]; then
   python experiment/pilot.py --config "${CONFIG}" --protocol "${PROTOCOL}" \
-    evaluate --name "reference_teacher${REF_STEPS}_${REF_SOURCE}" \
+    evaluate --name "teacher" \
     --steps "${REF_STEPS}" --source "${REF_SOURCE}" --output "${ref}"
 fi
 
-fast="${RUN}/final_nativefast${FAST_STEPS}_${FAST_SOURCE}.jsonl"
+fast="${RUN}/final_native_fast.jsonl"
 if [ ! -f "${fast}.complete.json" ]; then
   python experiment/pilot.py --config "${CONFIG}" --protocol "${PROTOCOL}" \
-    evaluate --name "nativefast${FAST_STEPS}_${FAST_SOURCE}" \
+    evaluate --name "native_fast" \
     --steps "${FAST_STEPS}" --source "${FAST_SOURCE}" --output "${fast}"
 fi
 

@@ -263,10 +263,19 @@ def objective(student, batch, mode, execute_steps, scales=None, metric_weight=0.
     endpoint_error = full_end - batch["teacher_end"]
     anchor = endpoint_error.square().mean()
     penalty = base.new_zeros(())
-    # metric_count == 0 (no marked rows in this batch) falls back to the full
-    # batch: an empty mean would be NaN and silently poison the update.
-    selected = slice(None, metric_count) if metric_count else slice(None)
-    if mode == "prefix":
+    # metric_count == 0 means this batch carries no designated physical rows:
+    # the physical penalty is zero, never an all-batch fallback (an empty mean
+    # would be NaN and silently poison the update; a full-batch fallback would
+    # charge ordinary rows for sensitivity they were not selected to carry).
+    # Batches are built role-first (ordinary rows, then designated physical
+    # rows), so the physical slice is the TAIL of the batch, not the head.
+    if metric_count:
+        selected = slice(len(batch["noise"]) - metric_count, None)
+    else:
+        selected = None
+    if selected is None:
+        penalty = base.new_zeros(())
+    elif mode == "prefix":
         early = mid_error[selected, :execute_steps]
         late = end_error[selected, :execute_steps]
         penalty = 0.5 * (early.square().mean() + late.square().mean())

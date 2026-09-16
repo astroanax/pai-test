@@ -82,7 +82,11 @@ def main():
     contexts = verified["contexts"]
     rows = validation_rows(contexts, config)
     metric_mode = verified["meta"]["metric_mode"]
+    # Perturbation radii are L2 NORMS of the 32-dimensional chunk direction,
+    # not per-coordinate RMS values. For 32 coordinates, L2 0.01 corresponds
+    # to RMS ~0.00177 (radius / sqrt(32)).
     radii = [0.005, 0.01, 0.02]
+    radius_kind = "L2 norm over the 16x2 chunk"
     rng = np.random.default_rng(11)
     report = {"cache": os.path.basename(cache_path),
               "cache_sha256": C.sha256_file(cache_path),
@@ -90,6 +94,8 @@ def main():
               "license_note": "privileged simulator supervision for a diagnostic",
               "metric_mode": metric_mode, "n_contexts": len(contexts),
               "sampled_rows": rows,
+              "radii": radii, "radius_kind": radius_kind,
+              "radius_rms_equivalent": [r / (32 ** 0.5) for r in radii],
               "sampled_scenes": sorted({int(contexts[i]["scene"]) for i in rows}),
               "protocol_id": None if protocol is None else protocol.get("protocol_id"),
               "source_hashes": C.source_hashes(),
@@ -166,6 +172,11 @@ def main():
         exact = None
         if adapter is not None:
             exact = exact_metric(context)
+        elif metric_mode == "exact":
+            # --no-simulate reuses the cached exact operator instead of
+            # omitting exact predictions: the stored metric IS the exact
+            # pullback operator for this context.
+            exact = metric.detach().clone()
         sets = {}
         for radius in radii:
             dims = 16 * 2
@@ -192,6 +203,17 @@ def main():
                 scene, history,
                 np.asarray(context["teacher_end"])[:config["execute_steps"]])
         target_mid = np.asarray(context["target_mid"], dtype=np.float32)
+        # Unperturbed teacher suffix + simulator execution, computed ONCE per
+        # context and reused for every direction (was repeated per direction).
+        baseline_cache = {}
+        if adapter is not None:
+            with torch.no_grad():
+                baseline = teacher_half_from(
+                    torch.from_numpy(target_mid).unsqueeze(0).to(device),
+                    adapter.noise_pred_net, cond, config["teacher_steps"])
+            baseline_cache["early"] = adapter.execute_from_history(
+                scene, history,
+                baseline[0, :config["execute_steps"]].cpu().numpy())
         for name, directions in sets.items():
             for direction in directions:
                 flat = np.asarray(direction, dtype=np.float32).reshape(-1)
@@ -228,15 +250,8 @@ def main():
                     early_features = adapter.execute_from_history(
                         scene, history,
                         completed[0, :config["execute_steps"]].cpu().numpy())
-                    with torch.no_grad():
-                        baseline = teacher_half_from(
-                            torch.from_numpy(target_mid).unsqueeze(0).to(device),
-                            adapter.noise_pred_net, cond, config["teacher_steps"])
-                    baseline_features = adapter.execute_from_history(
-                        scene, history,
-                        baseline[0, :config["execute_steps"]].cpu().numpy())
                     row["early_physical_squared"] = float(
-                        np.sum((early_features - baseline_features) ** 2))
+                        np.sum((early_features - baseline_cache["early"]) ** 2))
                     # LATE: perturb the late-branch input and execute
                     if "actual_end_error" in sets and name == "actual_end_error":
                         late_input = (np.asarray(context["target_end"], dtype=np.float64)
@@ -256,35 +271,76 @@ def main():
                 records.append(row)
 
     # predictor quality: each predictor is compared ONLY against its matching
-    # outcome, mirroring the trained penalty each one stands for
+    # outcome, mirroring the trained penalty each one stands for. Association
+    # is computed WITHIN each context (directional discrimination: does the
+    # predictor rank directions correctly for THIS context?) and then
+    # aggregated: median across contexts plus per-scene medians. A pooled
+    # correlation across contexts can reflect between-context scale
+    # differences rather than useful directional sensitivity, so pooled
+    # values are reported separately and never as the headline.
     report["association"] = {}
+    report["association_pooled"] = {}
     pairs = [("exact_pullback", "early_physical_squared"),
              ("identity_prefix", "early_physical_squared"),
              ("sketch_pullback", "early_physical_squared"),
              ("late_predicted", "late_physical_squared"),
              ("endpoint_predicted", "endpoint_physical_squared")]
+    context_scene = {index: int(contexts[index]["scene"]) for index in rows}
     for predictor, outcome in pairs:
         for name in sorted({r["set"] for r in records}):
-            subset = [r for r in records if r["set"] == name]
-            preds = [r.get(predictor) for r in subset]
-            outs = [r.get(outcome) for r in subset]
-            if any(p is None for p in preds) or any(o is None for o in outs):
-                continue
-            report["association"].setdefault(f"{predictor}->{outcome}", {})[name] = \
-                _spearman(preds, outs)
-    report["association_note"] = ("within-radius rank association; whole-chunk MSE is "
-                                 "constant on a sphere so its association is undefined "
-                                 "and is never reported as zero")
+            within = []
+            by_scene = {}
+            for index in rows:
+                subset = [r for r in records
+                          if r["set"] == name and r["context"] == index]
+                preds = [r.get(predictor) for r in subset]
+                outs = [r.get(outcome) for r in subset]
+                if any(p is None for p in preds) or any(o is None for o in outs):
+                    continue
+                stat = _spearman(preds, outs)
+                if stat.get("rho") is None:
+                    continue
+                within.append(stat["rho"])
+                by_scene.setdefault(context_scene[index], []).append(stat["rho"])
+            if within:
+                report["association"].setdefault(
+                    f"{predictor}->{outcome}", {})[name] = dict(
+                        median_rho=float(np.median(within)),
+                        n_contexts=len(within),
+                        by_scene={str(s): dict(median_rho=float(np.median(v)),
+                                               n_contexts=len(v))
+                                  for s, v in sorted(by_scene.items())})
+            pooled_subset = [r for r in records if r["set"] == name]
+            pooled_preds = [r.get(predictor) for r in pooled_subset]
+            pooled_outs = [r.get(outcome) for r in pooled_subset]
+            if not any(p is None for p in pooled_preds) and \
+                    not any(o is None for o in pooled_outs):
+                report["association_pooled"].setdefault(
+                    f"{predictor}->{outcome}", {})[name] = _spearman(
+                        pooled_preds, pooled_outs)
+    report["association_note"] = ("within-context directional rank association, "
+                                 "median across contexts plus per-scene medians; "
+                                 "pooled values live under association_pooled and "
+                                 "are never the headline; whole-chunk MSE is "
+                                 "constant on a sphere so its association is "
+                                 "undefined and is never reported as zero")
 
-    # sketch quality against the exact metric on actual student errors
+    # sketch quality against the exact metric on actual student errors.
+    # Without a student there is no actual error: use the cached
+    # (midpoint - target_mid) residual as the error direction, never the
+    # raw midpoint itself (a position, not an error).
     if metric_mode == "exact" and adapter is not None:
         report["sketch_audit"] = {}
         for index in rows[:8]:
             context = contexts[index]
             cond, jac_start, _, target = tensors_of(context)
             exact = exact_metric(context)
-            error_flat = (actual[index]["mid"].reshape(-1) if index in actual
-                          else np.asarray(context["midpoint"], dtype=np.float32).reshape(-1))
+            if index in actual:
+                error_flat = actual[index]["mid"].reshape(-1)
+            else:
+                mid = np.asarray(context["midpoint"], dtype=np.float32)
+                tgt = np.asarray(context["target_mid"], dtype=np.float32)
+                error_flat = (mid - tgt).reshape(-1)
             error = torch.from_numpy(np.asarray(error_flat, dtype=np.float32)).reshape(1, 16, 2).to(device)
             exact_value = float(pullback_quadratic(exact, error).item())
             exact_trace = float(pullback_trace(exact).item())

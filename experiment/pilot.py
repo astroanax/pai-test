@@ -58,9 +58,16 @@ def protocol_for(args, config):
     path = getattr(args, "protocol", None)
     command = getattr(args, "command", None)
     if command == "evaluate" and not path:
+        # Development evaluation (teacher / warm-start checks before locking)
+        # is explicitly labeled and can never enter final analysis; final
+        # evaluation always requires the lock.
+        if getattr(args, "development", False) and \
+                getattr(args, "allow_unlocked", False):
+            return None, None
         raise C.ProtocolError(
             "evaluate requires --protocol runs/protocol_locked.json; "
-            "unlocked test evaluation is not permitted")
+            "unlocked test evaluation is not permitted (development "
+            "evaluation needs --development --allow-unlocked)")
     if command == "train" and not path:
         if getattr(args, "initial", None) is not None:
             raise C.ProtocolError(
@@ -262,6 +269,7 @@ def _metric_entry(adapter, config, device, context, eps, metric_mode):
               "signature_initial", "signature_live")}
     entry["jacobian_start"] = branches["start"].astype(np.float32)
     entry["jacobian_end"] = branches["end"].astype(np.float32)
+    entry["has_metric"] = True
     if metric_mode == "exact":
         entry["metric_exact"] = pullback_metric_exact(
             suffix, y0, jac_start, config["execute_steps"]).detach().cpu().numpy()[0].astype(np.float32)
@@ -270,6 +278,11 @@ def _metric_entry(adapter, config, device, context, eps, metric_mode):
             suffix, y0, jac_start, config["execute_steps"],
             num_probes=config["num_probes"]).detach().cpu().numpy()[0].astype(np.float32)
     return entry
+
+
+def _context_key(context):
+    return (int(context["scene"]), str(context["split"]),
+            int(context["decision"]), int(context["step"]))
 
 
 def cmd_metrics(args, config, device):
@@ -317,25 +330,47 @@ def cmd_metrics(args, config, device):
     if not np.isfinite(repeat_gap) or repeat_gap > 1e-6:
         raise ValueError(f"repeated branch disagreement at scene {scene}: "
                          f"{repeat_gap}")
+    # Two linked datasets in one cache: ALL shared contexts are preserved for
+    # ordinary distillation and anchoring; the fixed subset additionally
+    # carries physical metrics, identified by stable (scene, split, decision,
+    # step) keys. Training draws each role from its own dataset, so an
+    # ordinary row never becomes physically marked by pool membership.
+    by_key = {_context_key(entry): entry for entry in out}
+    if len(by_key) != len(out):
+        raise ValueError("duplicate metric entries for one context")
+    full = []
+    for context in verified["contexts"]:
+        key = _context_key(context)
+        if key in by_key:
+            full.append(by_key[key])
+        else:
+            plain = {k: context[k] for k in
+                     ("scene", "split", "decision", "step", "condition", "noise",
+                      "midpoint", "target_mid", "target_end", "teacher_end",
+                      "history", "signature_initial", "signature_live")}
+            plain["has_metric"] = False
+            full.append(plain)
     meta = dict(schema_version=C.SCHEMA_VERSION, mode="shared",
                 metric_mode=metric_mode,
                 num_probes=config["num_probes"], epsilon=eps,
                 counts=dict(train=len(train_rows), validation=len(validation_rows),
-                            total=len(out)),
+                            total=len(full), metric_total=len(out)),
+                member_keys=[list(_context_key(entry)) for entry in out],
                 repeat_branch_gap=repeat_gap,
                 per_context_seconds=timings,
                 mean_context_seconds=float(np.mean(timings)),
                 source=verified["meta"].get("source"),
-                splits={row["split"] for row in out})
-    meta["splits"] = {split: sum(1 for row in out if row["split"] == split)
-                      for split in sorted({row["split"] for row in out})}
+                splits={row["split"] for row in full})
+    meta["splits"] = {split: sum(1 for row in full if row["split"] == split)
+                      for split in sorted({row["split"] for row in full})}
     lineage = dict(source_hashes=C.source_hashes(),
                    cache=C.sha256_file(args.cache),
                    cache_meta=verified["meta"],
                    epsilon=eps, metric_mode=metric_mode)
-    C.write_metric_cache(args.output, out, config, meta, lineage)
-    print(f"wrote metrics {args.output} contexts {len(out)}")
-    return dict(contexts=len(out), meta=meta)
+    C.write_metric_cache(args.output, full, config, meta, lineage)
+    print(f"wrote metrics {args.output} contexts {len(full)} "
+          f"({len(out)} with physical metrics)")
+    return dict(contexts=len(full), metric_contexts=len(out), meta=meta)
 
 
 def batch_from_contexts(contexts, indices, device, metric_mode, need_metric):
@@ -372,9 +407,13 @@ def cmd_train(args, config, device):
     scales, scale_stats = None, None
     if needs_metric:
         metric_key = "metric_exact" if metric_mode == "exact" else "probes"
-        jac_start = np.stack([c["jacobian_start"] for c in train_contexts])
-        jac_end = np.stack([c["jacobian_end"] for c in train_contexts])
-        metric = np.stack([c[metric_key] for c in train_contexts])
+        metric_train = [c for c in train_contexts if c.get("has_metric", False)]
+        if not metric_train:
+            raise ValueError("metric training needs has_metric rows; "
+                             "run the metrics stage first")
+        jac_start = np.stack([c["jacobian_start"] for c in metric_train])
+        jac_end = np.stack([c["jacobian_end"] for c in metric_train])
+        metric = np.stack([c[metric_key] for c in metric_train])
         for name, value in (("jacobian_start", jac_start), ("jacobian_end", jac_end),
                             (metric_key, metric)):
             if not np.isfinite(value).all():
@@ -392,37 +431,76 @@ def cmd_train(args, config, device):
     seed_state = torch.load(args.initial, map_location=device,
                             weights_only=True) if args.initial else None
     if seed_state is not None:
-        C.verify_student_provenance(seed_state, protocol, config, args.initial)
+        # Initialization is role-checked against the lock BEFORE optimization:
+        # only the hash-matched warm start may initialize locked training.
+        C.verify_student_provenance(seed_state, protocol, config, args.initial,
+                                    role="init")
+    if protocol is not None:
+        # Validate every locked training argument before spending optimization
+        # budget, rather than relying on later checkpoint rejection.
+        problems = []
+        if args.mode not in protocol.get("modes", []):
+            problems.append(f"mode {args.mode} not in locked {protocol['modes']}")
+        if int(args.seed) not in [int(s) for s in protocol.get("seeds", [])]:
+            problems.append(f"seed {args.seed} not in locked {protocol['seeds']}")
+        if int(args.updates) != int(protocol.get("updates", args.updates)):
+            problems.append(f"updates {args.updates} != locked {protocol['updates']}")
+        if C.sha256_file(args.cache) != protocol.get("cache_sha256"):
+            problems.append("training cache differs from the locked cache")
+        if problems:
+            raise C.ProtocolError("locked training arguments rejected: " +
+                                  "; ".join(problems))
     student = make_student(config, device, seed=args.seed,
                            state_dict=seed_state["student"] if seed_state else None)
     optimizer = torch.optim.AdamW(student.parameters(), lr=config["learning_rate"],
                                   weight_decay=config["weight_decay"])
     rng = np.random.default_rng(args.seed)
     n = len(train_contexts)
-    # the marked pool is drawn identically for every mode so all arms see the
-    # same minibatch streams; label-only modes simply apply their penalty to
-    # whichever rows land in the marked half
-    metric_rows = set(rng.choice(n, size=min(n, config["metric_contexts"]),
-                                 replace=False).tolist())
+    # Role-first batches: the first half is ordinary distillation over ALL
+    # shared contexts; the second half is designated physical rows drawn from
+    # the fixed metric subset. A role mask travels with the rows through the
+    # within-half shuffles, so an ordinary sample never becomes physically
+    # marked merely because its context also carries a metric, and every mode
+    # sees matched minibatch streams from the same seed.
+    half = config["batch_size"] // 2
+    metric_pool = [i for i, c in enumerate(train_contexts)
+                   if c.get("has_metric", False)]
+    if needs_metric and not metric_pool:
+        raise ValueError("metric training needs has_metric rows; "
+                         "run the metrics stage first")
     student.train()
     log = []
     grad_norms = []
     for update in range(args.updates):
-        first = rng.integers(0, n, size=config["batch_size"] // 2).tolist()
-        if metric_rows:
-            marked = rng.choice(sorted(metric_rows), size=config["batch_size"] // 2,
-                                replace=True).tolist()
+        ordinary = rng.integers(0, n, size=half).tolist()
+        rng.shuffle(ordinary)
+        if metric_pool:
+            physical = rng.choice(metric_pool, size=half,
+                                  replace=True).tolist()
         else:
-            marked = rng.integers(0, n, size=config["batch_size"] // 2).tolist()
-        indices = first + marked
-        rng.shuffle(indices)
-        batch = batch_from_contexts(train_contexts, indices, device, metric_mode,
-                                    needs_metric)
-        is_marked = torch.tensor([i in metric_rows for i in indices], device=device)
-        order = torch.argsort(~is_marked)
-        for key in batch:
-            batch[key] = batch[key][order]
-        metric_count = int(is_marked.sum().item())
+            physical = []
+        rng.shuffle(physical)
+        ordinary_batch = batch_from_contexts(train_contexts, ordinary, device,
+                                             metric_mode, False)
+        if physical:
+            physical_batch = batch_from_contexts(train_contexts, physical,
+                                                 device, metric_mode, needs_metric)
+            batch = {k: torch.cat([ordinary_batch[k], physical_batch[k]], dim=0)
+                     for k in ordinary_batch}
+            # physical-only keys (Jacobians, metric) are NaN-free on the
+            # designated rows; ordinary rows carry zeros there and are never
+            # selected by the tail slice.
+            for k in physical_batch:
+                if k not in batch:
+                    pad = torch.zeros((len(ordinary),) + physical_batch[k].shape[1:],
+                                      dtype=physical_batch[k].dtype,
+                                      device=device)
+                    batch[k] = torch.cat([pad, physical_batch[k]], dim=0)
+        else:
+            batch = ordinary_batch
+            if needs_metric:
+                raise ValueError("empty physical selection for a metric mode")
+        metric_count = len(physical)
         loss, parts = objective(student, batch, args.mode, config["execute_steps"],
                                 scales, metric_weight=config["metric_weight"],
                                 anchor_weight=config["anchor_weight"],
@@ -482,7 +560,14 @@ def cmd_evaluate(args, config, device):
     if args.student:
         student, payload = load_student(args.student, config, device)
         student.eval()
-        C.verify_student_provenance(payload, protocol, config, args.student)
+        if protocol is not None:
+            C.verify_student_provenance(payload, protocol, config, args.student,
+                                        role="final")
+        else:
+            # Unlocked runs are development only: the checkpoint must be the
+            # warm start evaluated as an explicitly labeled reference.
+            C.verify_student_provenance(payload, None, config, args.student,
+                                        role="reference")
         intrinsic_mode = str(payload["mode"])
         intrinsic_seed = int(payload["seed"])
         checkpoint_hash = C.sha256_file(args.student)
@@ -490,13 +575,26 @@ def cmd_evaluate(args, config, device):
     steps = args.steps
     split = "development" if args.development else "test"
     rng = np.random.default_rng(args.seed)
-    episodes = args.episodes if args.episodes is not None else (
-        config["development_episodes"] if args.development
-        else config["test_episodes"])
-    if episodes < 1:
-        raise ValueError("--episodes must be >= 1")
-    start = config["development_scene_start"] if args.development else config["test_scene_start"]
-    scenes = [start + episode for episode in range(episodes)]
+    if protocol is not None:
+        if args.development:
+            raise C.ProtocolError("locked evaluation is the final test run; "
+                                  "development evaluation is unlocked with "
+                                  "--development --allow-unlocked")
+        # Final evaluation scenes come from the lock, never from CLI/config
+        # overrides: a reduced lock must produce a reduced evaluation.
+        scenes = list(protocol["final_scenes"])
+        if args.episodes is not None and int(args.episodes) != len(scenes):
+            raise C.ProtocolError(
+                f"--episodes {args.episodes} conflicts with the locked "
+                f"{len(scenes)} final scenes; regenerate the lock instead")
+    else:
+        episodes = args.episodes if args.episodes is not None else (
+            config["development_episodes"] if args.development
+            else config["test_episodes"])
+        if episodes < 1:
+            raise ValueError("--episodes must be >= 1")
+        start = config["development_scene_start"] if args.development else config["test_scene_start"]
+        scenes = [start + episode for episode in range(episodes)]
     unknown = sorted(set(scenes) - C.scene_range(config, split))
     if unknown:
         raise ValueError(f"evaluation scenes outside the {split} range: {unknown[:5]}")

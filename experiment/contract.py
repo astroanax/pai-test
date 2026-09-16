@@ -35,18 +35,27 @@ CUDNN_ENV_FLAG = "EXECPB_DISABLE_CUDNN"
 
 
 def cudnn_healthy(device="cuda", timeout_s=60):
-    """Probe whether cuDNN convolutions actually run on this host.
+    """Probe whether convolutions actually run on the requested device.
 
     Importing torch succeeds even when the driver/cuDNN combination cannot
     initialize; this probe catches that before the experiment spends its
-    budget. Returns a dict with healthy True/False and a recommendation.
+    budget. It uses the requested device (not a hard-coded one), synchronizes
+    before declaring success, checks the subprocess return code, and
+    distinguishes "native cuDNN works" from "the selected fallback works".
+    Returns a dict with healthy True/False and a recommendation.
     """
     import subprocess as _sp
     import sys as _sys
     code = (
-        "import torch; "
-        "x = torch.randn(1,3,32,32).cuda(); w = torch.randn(8,3,3,3).cuda(); "
-        "torch.nn.functional.conv2d(x, w); print('conv_ok')"
+        "import torch, json; "
+        f"device = torch.device({device!r}); "
+        "x = torch.randn(1,3,32,32, device=device); "
+        "w = torch.randn(8,3,3,3, device=device); "
+        "y = torch.nn.functional.conv2d(x, w); "
+        "torch.cuda.synchronize() if device.type == 'cuda' else None; "
+        "print('conv_ok:' + str(bool(torch.backends.cudnn.is_available() and "
+        "torch.backends.cudnn.enabled))); "
+        "print('cudnn_enabled=' + str(torch.backends.cudnn.enabled))"
     )
     try:
         out = _sp.run([_sys.executable, "-c", code], capture_output=True,
@@ -54,8 +63,13 @@ def cudnn_healthy(device="cuda", timeout_s=60):
     except Exception as error:
         return dict(healthy=False, error=f"probe failed: {error}",
                     recommendation="rerun on a host with working cuDNN")
-    if "conv_ok" in out.stdout:
-        return dict(healthy=True)
+    if out.returncode == 0 and "conv_ok:True" in out.stdout:
+        return dict(healthy=True, native_cudnn=True)
+    if out.returncode == 0 and "conv_ok:False" in out.stdout:
+        return dict(healthy=True, native_cudnn=False,
+                    note="convolution runs with the selected fallback, not "
+                         "native cuDNN; latency comparisons require identical "
+                         "settings")
     tail = (out.stderr or out.stdout)[-800:]
     return dict(healthy=False, error=tail,
                 recommendation="set EXECPB_DISABLE_CUDNN=1 to run the "
@@ -71,16 +85,33 @@ def apply_compute_env(device="cuda"):
     """Apply the compute environment: disable cuDNN process-wide when requested.
 
     cuDNN is enabled by default; only an explicit EXECPB_DISABLE_CUDNN=1 opts
-    out. The choice is recorded in every smoke report and student sidecar so a
-    fallback run is never mistaken for a full-cuDNN run. Returns the flag used.
+    out. The full resolved settings (cuDNN availability/enabled/version, TF32,
+    deterministic algorithms, device, hardware) are recorded in every smoke
+    report and student sidecar so a fallback run is never mistaken for a
+    full-cuDNN run, and latency comparisons can require identical settings.
+    Returns the resolved settings dict.
     """
     import os as _os
     disabled = cudnn_disabled()
+    import torch as _torch
     if disabled:
-        import torch as _torch
         _torch.backends.cudnn.enabled = False
         _torch.backends.cudnn.benchmark = False
-    return dict(cudnn_disabled=bool(disabled), flag=CUDNN_ENV_FLAG)
+    try:
+        hardware = _torch.cuda.get_device_name(0) if _torch.cuda.is_available() else "cpu"
+    except Exception:
+        hardware = "unknown"
+    return dict(cudnn_disabled=bool(disabled), flag=CUDNN_ENV_FLAG,
+                cudnn_available=bool(_torch.backends.cudnn.is_available()),
+                cudnn_enabled=bool(_torch.backends.cudnn.enabled),
+                cudnn_version=(_torch.backends.cudnn.version()
+                               if _torch.backends.cudnn.is_available() else None),
+                tf32_allow=_torch.backends.cuda.matmul.allow_tf32,
+                deterministic=_torch.are_deterministic_algorithms_enabled(),
+                device=str(device), hardware=hardware,
+                # torch 2.6+ exposes __version__ as a TorchVersion object, which
+                # weights_only loading rejects: store a plain str instead.
+                torch_version=str(getattr(_torch, "__version__", "unknown")))
 
 
 POSITIVE_INTS = ["teacher_steps", "execute_steps", "episode_steps",
@@ -172,12 +203,27 @@ def asset_hashes(config):
 
 
 def canonical_choices(config, modes=None, seeds=None, updates=None, warm=None,
-                      cache=None, smoke_report=None):
-    """Every experimental choice that must be part of the canonical identifier."""
+                      cache=None, smoke_report=None, final_scenes=None,
+                      primary_contrast=None, compute=None):
+    """Every experimental choice that must be part of the canonical identifier.
+
+    The final scene list, the primary contrast, and the resolved compute
+    settings are included: changing any of them without regenerating the lock
+    changes the identifier, so stale locks cannot be reused silently.
+    """
     return dict(config_sha256=combined_id(config),
                 modes=None if modes is None else sorted(modes),
                 seeds=None if seeds is None else sorted(int(s) for s in seeds),
                 updates=None if updates is None else int(updates),
+                final_scenes=(None if final_scenes is None
+                              else sorted(int(s) for s in final_scenes)),
+                primary_contrast=(None if primary_contrast is None
+                                  else [str(primary_contrast[0]),
+                                        str(primary_contrast[1])]),
+                compute=compute,
+                metric_mode=config.get("metric_mode", "exact"),
+                teacher_steps=int(config.get("teacher_steps", 0)),
+                source=config.get("source"),
                 warm_sha256=(sha256_file(warm) if warm and os.path.exists(warm)
                              else "absent"),
                 cache_sha256=(sha256_file(cache) if cache and os.path.exists(cache)
@@ -188,8 +234,14 @@ def canonical_choices(config, modes=None, seeds=None, updates=None, warm=None,
 
 
 def protocol_id(config, config_path, cache_path, warm_path, modes, seeds, updates,
-                smoke_report=None, repository=None):
+                smoke_report=None, repository=None, final_scenes=None,
+                primary_contrast=None, compute=None):
     repository = repository or config["repository"]
+    choices = canonical_choices(config, modes, seeds, updates, warm_path,
+                                cache_path, smoke_report,
+                                final_scenes=final_scenes,
+                                primary_contrast=primary_contrast,
+                                compute=compute)
     parts = dict(config=source_hashes(),
                  config_file=sha256_file(config_path),
                  cache=sha256_file(cache_path),
@@ -200,8 +252,7 @@ def protocol_id(config, config_path, cache_path, warm_path, modes, seeds, update
                  assets=asset_hashes(config),
                  upstream=upstream_hashes(repository),
                  upstream_commit=upstream_commit(repository),
-                 choices=canonical_choices(config, modes, seeds, updates, warm_path,
-                                           cache_path, smoke_report),
+                 choices=choices,
                  resolved=config)
     return combined_id(parts), parts
 
@@ -372,6 +423,8 @@ def reserve_outputs(paths):
     Existence of the data file is not enough information: a partial artifact or a
     crashed run must also block reuse. The claim is replaced by a completion
     record when the producer finishes, and by an `.incomplete` marker on failure.
+    Claims are created exclusively (O_EXCL): two concurrent writers cannot both
+    hold the same output.
     """
     paths = [p for p in paths if p]
     taken = []
@@ -385,16 +438,26 @@ def reserve_outputs(paths):
     for path in paths:
         parent = os.path.dirname(os.path.abspath(path)) or "."
         os.makedirs(parent, exist_ok=True)
-        with open(path + ".reserved", "w") as handle:
-            handle.write(json.dumps(dict(state="reserved")))
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            handle = os.open(path + ".reserved", flags)
+        except FileExistsError:
+            raise ValueError("output claimed by a concurrent writer: " + path)
+        with os.fdopen(handle, "w") as stream:
+            stream.write(json.dumps(dict(state="reserved")))
     return paths
 
 
 def complete_output(path, payload=None):
+    detail = dict(payload or {})
+    if os.path.exists(path):
+        detail.setdefault("sha256", sha256_file(path))
+        detail.setdefault("bytes", os.path.getsize(path))
+    else:
+        detail.setdefault("bytes", 0)
     _atomic_json(path + COMPLETION_SUFFIX,
                  dict(state="complete", artifact=os.path.basename(path),
-                      bytes=(os.path.getsize(path) if os.path.exists(path) else 0),
-                      detail=payload or {}))
+                      detail=detail))
     for marker in (path + ".reserved", path + ".incomplete"):
         if os.path.exists(marker):
             os.remove(marker)
@@ -420,6 +483,28 @@ def is_complete(path):
             return json.load(handle).get("state") == "complete"
     except Exception:
         return False
+
+
+def verify_completed(path, role=None, protocol=None):
+    """Verify a skipped artifact before reuse: completion record, existence,
+    byte hash, role, and protocol binding.
+
+    Runners must call this instead of trusting marker existence.
+    """
+    record = path + COMPLETION_SUFFIX
+    if not os.path.exists(record):
+        raise ValueError(f"{path} has no completion record; rebuild it")
+    with open(record) as handle:
+        marker = json.load(handle)
+    if marker.get("state") != "complete":
+        raise ValueError(f"{path} completion state is {marker.get('state')!r}")
+    if not os.path.exists(path):
+        raise ValueError(f"{path} completed but the artifact is missing")
+    recorded = (marker.get("detail") or {}).get("sha256")
+    if recorded and sha256_file(path) != recorded:
+        raise ValueError(f"{path} bytes differ from its completion record; "
+                         "rebuild it")
+    return True
 
 
 def check_manifest():
@@ -567,16 +652,33 @@ def verify_label_cache(path_or_data, config, expect_mode=None,
     if meta.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"cache schema {meta.get('schema_version')} != "
                          f"{SCHEMA_VERSION}; rebuild the cache")
+    lineage = data.get("lineage") or {}
+    if lineage.get("source_hashes") != source_hashes():
+        raise ValueError("cache was built by different experiment sources "
+                         "(collection/normalization/metric implementation "
+                         "changed); rebuild it rather than reusing old data")
+    if lineage.get("epsilon") != config.get("finite_difference_epsilon") and \
+            require_metric:
+        raise ValueError("metric cache epsilon differs from the configuration; "
+                         "rebuild it")
     if expect_mode and meta.get("mode") != expect_mode:
         raise ValueError(f"cache mode {meta.get('mode')!r} != expected {expect_mode!r}")
     metric_key = "metric_exact" if config.get("metric_mode", "exact") == "exact" \
         else "probes"
     splits = {}
+    metric_rows = 0
     for index, context in enumerate(contexts):
         missing = [k for k in CONTEXT_LABEL_KEYS + ["scene", "split", "history"]
                    if k not in context]
         if missing:
             raise ValueError(f"cache context {index} missing {missing}")
+        has_metric = context.get("has_metric", metric_key in context)
+        if has_metric:
+            metric_rows += 1
+            missing = [k for k in CONTEXT_METRIC_KEYS + [metric_key]
+                       if k not in context]
+            if missing:
+                raise ValueError(f"metric cache context {index} missing {missing}")
         scene = int(context["scene"])
         expected_split = split_of_scene(config, scene)
         if context["split"] != expected_split:
@@ -586,27 +688,48 @@ def verify_label_cache(path_or_data, config, expect_mode=None,
             raise ValueError(f"cache contains unplanned scene {scene}")
         splits.setdefault(context["split"], 0)
         splits[context["split"]] += 1
-        if require_metric:
-            missing = [k for k in CONTEXT_METRIC_KEYS + [metric_key]
-                       if k not in context]
-            if missing:
-                raise ValueError(f"metric cache context {index} missing {missing}")
         verify_tensors({k: np.asarray(context[k]) for k in CONTEXT_LABEL_KEYS},
                        f"cache context {index}")
-        if require_metric:
+        if has_metric:
             verify_tensors({k: np.asarray(context[k]) for k in
                             CONTEXT_METRIC_KEYS + [metric_key]},
                            f"metric cache context {index}")
         if context.get("history"):
             verify_tensors({"history": np.asarray(context["history"], dtype=np.float64)},
                            f"cache context {index}")
+        for key, shape in (("condition", (514,)), ("noise", (16, 2)),
+                           ("midpoint", (16, 2)), ("target_mid", (16, 2)),
+                           ("target_end", (16, 2)), ("teacher_end", (16, 2))):
+            actual_shape = tuple(np.asarray(context[key]).shape)
+            if actual_shape != shape:
+                raise ValueError(f"cache context {index}: {key} shape "
+                                 f"{actual_shape} != {shape}; rebuild the cache")
+        if has_metric:
+            phys, prefix = 4 * config["execute_steps"], config["execute_steps"] * 2
+            for key, shape in (("jacobian_start", (phys, prefix)),
+                               ("jacobian_end", (phys, prefix))):
+                actual_shape = tuple(np.asarray(context[key]).shape)
+                if actual_shape != shape:
+                    raise ValueError(f"metric cache context {index}: {key} shape "
+                                     f"{actual_shape} != {shape}; rebuild it")
+    if require_metric and not metric_rows:
+        raise ValueError("metric cache holds no has_metric rows; "
+                         "run the metrics stage before metric training")
     return dict(contexts=contexts, meta=meta, splits=splits,
                 scenes=sorted({int(c["scene"]) for c in contexts}),
-                n_contexts=len(contexts))
+                n_contexts=len(contexts), n_metric=metric_rows)
 
 
 def select_split(verified, split):
     return [c for c in verified["contexts"] if c["split"] == split]
+
+
+def metric_rows(verified, config):
+    """Rows of a metric cache that carry physical metrics (the linked subset)."""
+    metric_key = "metric_exact" if config.get("metric_mode", "exact") == "exact" \
+        else "probes"
+    return [c for c in verified["contexts"]
+            if c.get("has_metric", metric_key in c)]
 
 
 def metric_subset(verified, config, limit=None, seed=915):
@@ -699,6 +822,35 @@ def verify_current_protocol(protocol, config, config_path, repository=None,
             problems.append(f"{name} is missing at {path}")
         elif sha256_file(path) != recorded:
             problems.append(f"{name} bytes differ from the lock")
+    canonical = protocol.get("canonical_choices")
+    if canonical is None:
+        problems.append("lock predates canonical-choice binding; regenerate it")
+    else:
+        rebuilt = combined_id(dict(
+            config=protocol.get("config", source_hashes()),
+            config_file=(sha256_file(config_path)
+                         if os.path.exists(config_path) else "absent"),
+            cache=protocol.get("cache_sha256"),
+            warm=protocol.get("warm_start_sha256"),
+            smoke_report=protocol.get("smoke_report_sha256"),
+            assets=protocol.get("assets", asset_hashes(config)),
+            upstream=protocol.get("upstream"),
+            upstream_commit=protocol.get("upstream_commit"),
+            choices=canonical,
+            resolved=protocol.get("resolved_config")))
+        if rebuilt != protocol.get("protocol_id"):
+            problems.append("lock payload was edited without regenerating the "
+                            "identifier (scenes, contrast, modes, seeds, "
+                            "updates, or compute changed)")
+        for field in ("modes", "seeds", "updates", "final_scenes",
+                      "primary_contrast"):
+            locked = protocol.get(field)
+            canon = canonical.get(field)
+            norm = (sorted(locked) if isinstance(locked, list)
+                    and field in ("modes", "final_scenes") else locked)
+            if canon != norm:
+                problems.append(f"lock field {field} disagrees with the canonical "
+                                "payload; regenerate the lock")
     if problems:
         raise ProtocolError("protocol lock is stale for stage " + stage + ": " +
                             "; ".join(problems))
@@ -716,24 +868,57 @@ def load_protocol(path, expect_id=None):
     return protocol
 
 
-def verify_student_provenance(payload, protocol, config, path):
+def verify_student_provenance(payload, protocol, config, path, role="final"):
     """A checkpoint must belong to the active protocol and its own metadata.
 
-    The unlocked warm start (protocol_id None, label-only mode) is a legitimate
-    input to locked fine-tuning: it predates the lock, so lock comparisons are
-    skipped and only the metric-mode contract and file existence are checked.
+    Roles are validated separately:
+    - "init": the file itself must be the locked warm start (hash equality
+      with warm_start_sha256). Mode labels are never trusted.
+    - "final": full match on protocol id, mode, seed, updates, cache hash,
+      and initialization hash.
+    - "reference": evaluating a warm-start checkpoint as a behavioral
+      reference. The file hash must equal warm_start_sha256 (locked) or the
+      protocol must be None with an explicit unlocked development run.
+
+    An unlocked uniform/prefix checkpoint never passes as initialization or
+    as a final student merely because its protocol id is None.
     """
     problems = []
-    if protocol is not None and payload.get("protocol_id") is None and \
-            payload.get("mode") in ("uniform", "prefix"):
-        # load_student already proved the file loads; only the metric contract
-        # matters here
-        if payload.get("metric_mode", config.get("metric_mode", "exact")) != \
-                config.get("metric_mode", "exact"):
-            raise ProtocolError("warm-start checkpoint mismatch for " + str(path) +
-                                ": warm-start metric mode differs from the "
-                                "configuration")
+    if role == "init":
+        if protocol is None:
+            problems.append("initialization requires a protocol lock holding "
+                            "the warm-start hash")
+        elif not path or not os.path.exists(path):
+            problems.append("initialization file missing: " + str(path))
+        elif sha256_file(path) != protocol.get("warm_start_sha256"):
+            problems.append("initialization file hash != locked warm_start_sha256; "
+                            "a different unlocked checkpoint cannot initialize "
+                            "locked training")
+        if payload.get("metric_mode") != config.get("metric_mode", "exact"):
+            problems.append("warm-start metric mode differs from the configuration")
+        if problems:
+            raise ProtocolError("checkpoint provenance mismatch for " + str(path) +
+                                ": " + "; ".join(problems))
         return True
+    if role == "reference":
+        if protocol is not None:
+            if not path or not os.path.exists(path):
+                problems.append("reference file missing: " + str(path))
+            elif sha256_file(path) != protocol.get("warm_start_sha256"):
+                problems.append("reference file hash != locked warm_start_sha256")
+        elif payload.get("protocol_id") is not None:
+            problems.append("reference role with an unlocked protocol requires an "
+                            "unlocked warm-start checkpoint")
+        if payload.get("mode") not in ("uniform", "prefix"):
+            problems.append(f"reference must be a warm-start mode, got "
+                            f"{payload.get('mode')!r}")
+        if problems:
+            raise ProtocolError("reference provenance mismatch for " + str(path) +
+                                ": " + "; ".join(problems))
+        return True
+    if protocol is not None and payload.get("protocol_id") is None:
+        problems.append("unlocked checkpoint cannot serve as a final student; "
+                        "only the hash-matched warm start may initialize training")
     if protocol is not None:
         if payload.get("protocol_id") != protocol.get("protocol_id"):
             problems.append(f"checkpoint protocol id {payload.get('protocol_id')} "
@@ -807,6 +992,17 @@ def require_complete(frame, protocol, method, baseline,
         if missing_pairs:
             raise ValueError(f"{name}: {len(missing_pairs)} planned evaluation "
                              f"episodes missing, e.g. {missing_pairs[:5]}")
+        keys = [(str(r.get("method")), int(r[columns[0]]), int(r[columns[1]]))
+                for r in rows if str(r.get("method")) == name]
+        if len(keys) != len(set(keys)):
+            seen, dupes = set(), set()
+            for k in keys:
+                if k in seen:
+                    dupes.add(k)
+                seen.add(k)
+            dupes = sorted(dupes)
+            raise ValueError(f"{name}: duplicate evaluation episodes {dupes[:5]}; "
+                             "never silently deduplicate")
         if len(observed) != len(expected_pairs):
             raise ValueError(f"{name}: {len(observed)} rows for "
                              f"{len(expected_pairs)} planned episodes (duplicates?)")
