@@ -1,8 +1,0 @@
-Traceback (most recent call last):
-  File "/home/b231090pe/rehan/execution-pullback-test/experiment/lock_protocol.py", line 145, in <module>
-    raise SystemExit(main())
-  File "/home/b231090pe/rehan/execution-pullback-test/experiment/lock_protocol.py", line 74, in main
-    raise ValueError("smoke report came from different experiment sources; "
-ValueError: smoke report came from different experiment sources; rerun experiment/smoke.py
-[relock] FAIL: lock
-RELOCK_EXIT=1

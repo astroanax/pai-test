@@ -1,2 +1,0 @@
-[train] mode uniform: label-only path, no Jacobians, no transported metric, no scale estimation
-wrote student runs-full/warm.pt mode uniform

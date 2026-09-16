@@ -1,6 +1,0 @@
-Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
-Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
-Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
-See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
-[train] scales {"endpoint": 0.45432591438293457, "identity": 0.4358326196670532, "pullback": 0.234037846326828} stats {"metric_mode": "exact", "zero_sensitivity_fraction": 0.62890625, "n_positive_transported": 95, "support": {"endpoint": 95, "identity": 96, "pullback": 96}, "low_support": [], "n_rows": 256, "endpoint_median": 0.45432591438293457, "identity_median": 0.4358326196670532, "pullback_median": 0.234037846326828}
-wrote student runs-full/profile_student.pt mode pullback

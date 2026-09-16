@@ -1,3 +1,10 @@
+"""Artifact contracts for the latent-controllability experiment.
+
+Metric-free: no Jacobians, no pullback probes, no metric weights. This
+module governs artifact integrity (hashes, sidecars, reservations),
+configuration validation, deterministic seeding, scene splits, cache/bank
+lineage, protocol locks, and student provenance.
+"""
 import hashlib
 import json
 import os
@@ -6,157 +13,46 @@ import tempfile
 
 import numpy as np
 
-SOURCE_FILES = ["core.py", "hri_adapter.py", "pilot.py", "diagnose.py",
-                "analyze.py", "sanity.py", "preflight.py", "lock_protocol.py",
-                "contract.py", "smoke.py", "run_comparison.sh", "vertical_test.sh",
-                "resume_vertical.sh", "relock_and_resume.sh",
+SCHEMA_VERSION = 3
+
+SOURCE_FILES = ["contract.py", "hri_adapter.py", "pairs.py", "train.py",
+                "geometry.py", "correction.py", "evaluate.py", "readiness.py",
+                "lock.py", "analyze.py", "cli.py", "collect.py", "sanity.py",
                 "config.json"]
-RESUME_HELPERS = ["resume_vertical.sh", "relock_and_resume.sh"]
-UPSTREAM_FILES = ["external/models/unet.py", "external/models/resnet.py",
-                  "external/models/pusht.py"]
 PACKAGES = ["torch", "torchvision", "numpy", "scipy", "pandas", "gym",
             "pygame", "pymunk", "shapely", "cv2", "skimage", "zarr",
             "diffusers", "imageio_ffmpeg"]
-SCHEMA_VERSION = 2
-CACHE_FINGERPRINT_KEYS = ["source", "teacher_steps", "execute_steps",
-                          "episode_steps", "contexts_per_episode",
-                          "finite_difference_epsilon", "legacy",
-                          "clip_actions", "train_scene_start",
-                          "train_episodes", "validation_scene_start",
-                          "validation_episodes", "development_scene_start",
-                          "development_episodes", "test_scene_start",
-                          "test_episodes", "repository", "metric_mode",
-                          "num_probes"]
+
+SIDECAR_REQUIRED = (".pt", ".pth", ".npz", ".jsonl")
+SELF_DESCRIBING = (".json",)
+
+COMPLETION_SUFFIX = ".complete.json"
+RESERVED_SUFFIX = ".reserved"
+INCOMPLETE_SUFFIX = ".incomplete.json"
+
 SCENE_RANGES = {
+    "development": ("development_scene_start", "development_episodes"),
     "train": ("train_scene_start", "train_episodes"),
     "validation": ("validation_scene_start", "validation_episodes"),
-    "development": ("development_scene_start", "development_episodes"),
-    "test": ("test_scene_start", "test_episodes"),
+    "diagnostic": ("diagnostic_scene_start", "diagnostic_episodes"),
+    "final": ("final_scene_start", "final_episodes"),
 }
-CUDNN_ENV_FLAG = "EXECPB_DISABLE_CUDNN"
 
+POSITIVE_INTS = ["teacher_steps", "execute_steps", "episode_steps", "width",
+                 "batch_size", "warm_updates", "updates",
+                 "anchors_per_history", "directions_per_anchor",
+                 "development_episodes", "train_episodes",
+                 "validation_episodes", "diagnostic_episodes",
+                 "final_episodes"]
+ALLOWED_ARMS = {"anchor", "augmented", "gad"}
 
-def normalize_seeds(seeds):
-    """Normalize locked seeds once: ints, sorted, deduplicated check by caller."""
-    return sorted(int(s) for s in seeds)
-
-
-def cudnn_healthy(device="cuda", timeout_s=60):
-    """Probe whether convolutions actually run on the requested device.
-
-    Importing torch succeeds even when the driver/cuDNN combination cannot
-    initialize; this probe catches that before the experiment spends its
-    budget. It uses the requested device (not a hard-coded one), synchronizes
-    before declaring success, checks the subprocess return code, and
-    distinguishes "native cuDNN works" from "the selected fallback works".
-    Returns a dict with healthy True/False and a recommendation.
-    """
-    import subprocess as _sp
-    import sys as _sys
-    import os as _os
-    # The probe must apply the fallback flag itself: the child process
-    # inherits the flag through the environment so "fallback works" is a
-    # measured claim, not an assumption.
-    child_env = dict(_os.environ)
-    flag_set = _os.environ.get(CUDNN_ENV_FLAG, "").strip() in ("1", "true", "yes")
-    if flag_set:
-        child_env[CUDNN_ENV_FLAG] = "1"
-    code = (
-        "import os as _o, torch, json; "
-        "flag = _o.environ.get('EXECPB_DISABLE_CUDNN','').strip() in ('1','true','yes'); "
-        "torch.backends.cudnn.enabled = (not flag) and torch.backends.cudnn.enabled; "
-        "import torch.utils.collect_env as _ce; "
-        f"device = torch.device({device!r}); "
-        "x = torch.randn(1,3,32,32, device=device); "
-        "w = torch.randn(8,3,3,3, device=device); "
-        "y = torch.nn.functional.conv2d(x, w); "
-        "torch.cuda.synchronize() if device.type == 'cuda' else None; "
-        "print('conv_ok:' + str(bool(torch.backends.cudnn.is_available() and "
-        "torch.backends.cudnn.enabled))); "
-        "print('cudnn_enabled=' + str(torch.backends.cudnn.enabled)); "
-        "print('flag=' + str(flag)); "
-        "print('hardware=' + (torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'))"
-    )
-    try:
-        out = _sp.run([_sys.executable, "-c", code], capture_output=True,
-                      text=True, timeout=timeout_s, env=child_env)
-    except Exception as error:
-        return dict(healthy=False, error=f"probe failed: {error}",
-                    recommendation="rerun on a host with working cuDNN",
-                    device=str(device), fallback_applied=flag_set)
-    if out.returncode == 0 and "conv_ok:True" in out.stdout:
-        return dict(healthy=True, native_cudnn=True, device=str(device),
-                    fallback_applied=flag_set,
-                    hardware=_hardware_from_probe(out.stdout))
-    if out.returncode == 0 and "conv_ok:False" in out.stdout:
-        return dict(healthy=True, native_cudnn=False,
-                    device=str(device), fallback_applied=flag_set,
-                    hardware=_hardware_from_probe(out.stdout),
-                    note="convolution runs with the selected fallback, not "
-                         "native cuDNN; latency comparisons require identical "
-                         "settings")
-    tail = (out.stderr or out.stdout)[-800:]
-    return dict(healthy=False, error=tail,
-                recommendation="set EXECPB_DISABLE_CUDNN=1 to run the "
-                               "experiment with cuDNN disabled",
-                device=str(device), fallback_applied=flag_set,
-                hardware=_hardware_from_probe(out.stdout))
-
-
-def _hardware_from_probe(stdout):
-    for line in (stdout or "").splitlines():
-        if line.startswith("hardware="):
-            return line.split("=", 1)[1].strip()
-    return "unknown"
-
-
-def cudnn_disabled():
-    import os as _os
-    return _os.environ.get(CUDNN_ENV_FLAG, "").strip() in ("1", "true", "yes")
-
-
-def apply_compute_env(device="cuda"):
-    """Apply the compute environment: disable cuDNN process-wide when requested.
-
-    cuDNN is enabled by default; only an explicit EXECPB_DISABLE_CUDNN=1 opts
-    out. The full resolved settings (cuDNN availability/enabled/version, TF32,
-    deterministic algorithms, device, hardware) are recorded in every smoke
-    report and student sidecar so a fallback run is never mistaken for a
-    full-cuDNN run, and latency comparisons can require identical settings.
-    Returns the resolved settings dict.
-    """
-    import os as _os
-    disabled = cudnn_disabled()
-    import torch as _torch
-    if disabled:
-        _torch.backends.cudnn.enabled = False
-        _torch.backends.cudnn.benchmark = False
-    try:
-        hardware = _torch.cuda.get_device_name(0) if _torch.cuda.is_available() else "cpu"
-    except Exception:
-        hardware = "unknown"
-    return dict(cudnn_disabled=bool(disabled), flag=CUDNN_ENV_FLAG,
-                cudnn_available=bool(_torch.backends.cudnn.is_available()),
-                cudnn_enabled=bool(_torch.backends.cudnn.enabled),
-                cudnn_version=(_torch.backends.cudnn.version()
-                               if _torch.backends.cudnn.is_available() else None),
-                tf32_allow=_torch.backends.cuda.matmul.allow_tf32,
-                deterministic=_torch.are_deterministic_algorithms_enabled(),
-                device=str(device), hardware=hardware,
-                # torch 2.6+ exposes __version__ as a TorchVersion object, which
-                # weights_only loading rejects: store a plain str instead.
-                torch_version=str(getattr(_torch, "__version__", "unknown")))
-
-
-POSITIVE_INTS = ["teacher_steps", "execute_steps", "episode_steps",
-                 "contexts_per_episode", "batch_size", "width", "num_probes",
-                 "metric_contexts", "validation_metric_contexts", "updates",
-                 "train_episodes", "validation_episodes", "development_episodes",
-                 "test_episodes"]
-CONTEXT_LABEL_KEYS = ["condition", "noise", "midpoint", "target_mid",
-                      "target_end", "teacher_end"]
-CONTEXT_METRIC_KEYS = ["jacobian_start", "jacobian_end"]
-COMPLETION_SUFFIX = ".complete.json"
+HISTORY_CONTEXT_KEYS = ("history_id", "scene", "split", "decision", "history",
+                        "sig_initial", "sig_live", "condition", "endpoint",
+                        "collector_hash")
+PAIR_RECORD_KEYS = ("pair_id", "history_id", "anchor_id", "direction_id",
+                    "q", "u", "rho", "source", "t0", "t1", "condition",
+                    "teacher_steps")
+PAIR_META_KEYS = ("member_keys", "rho", "source", "teacher_steps")
 
 
 class ProtocolError(ValueError):
@@ -169,7 +65,7 @@ def experiment_dir():
 
 def sha256_file(path):
     if not os.path.exists(path):
-        raise FileNotFoundError("missing file " + path)
+        raise FileNotFoundError("missing file " + str(path))
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         for block in iter(lambda: handle.read(65536), b""):
@@ -193,21 +89,6 @@ def source_hashes():
     return {os.path.basename(k): v for k, v in hashes.items()}
 
 
-def upstream_hashes(repository):
-    return _hash_many([os.path.join(repository, name) for name in UPSTREAM_FILES])
-
-
-def upstream_commit(repository):
-    try:
-        out = subprocess.run(["git", "-C", repository, "rev-parse", "HEAD"],
-                             capture_output=True, text=True, timeout=20)
-        if out.returncode == 0:
-            return out.stdout.strip()
-    except Exception:
-        pass
-    return "unknown"
-
-
 def package_versions(names=None):
     out = {}
     for name in (names or PACKAGES):
@@ -217,11 +98,6 @@ def package_versions(names=None):
         except Exception as error:
             out[name] = "missing: " + str(error)
     return out
-
-
-def combined_id(parts):
-    blob = json.dumps(parts, sort_keys=True, default=str)
-    return hashlib.sha256(blob.encode()).hexdigest()[:32]
 
 
 def asset_hashes(config):
@@ -235,99 +111,26 @@ def asset_hashes(config):
     return out
 
 
-EVAL_ROLES = ("student", "teacher_reference", "native_fast_reference",
-              "warm_reference")
-STUDENT_ARMS = ("uniform", "prefix", "endpoint", "pullback", "identity",
-                "scalar")
+def combined_id(parts):
+    blob = json.dumps(parts, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:32]
 
 
-def resolve_eval_role(name, student_path, references):
-    """Item 3: an evaluation role is derived, never trusted from --name.
-
-    student: requires --student; mode/seed come from the checkpoint, the
-    checkpoint hash must be non-null, and the alias must equal the intrinsic
-    mode. teacher/native_fast/warm references require a declared reference
-    spec and prohibit names belonging to student arms. A teacher run named
-    pullback fails here, before any rollout.
-    """
-    references = references or {}
-    if student_path is not None:
-        return "student"
-    for role in ("teacher_reference", "native_fast_reference",
-                 "warm_reference"):
-        spec = references.get(role.split("_")[0]
-                              if role != "teacher_reference" else "teacher")
-        if spec is None and role == "warm_reference":
-            spec = references.get("warm")
-        if name == role or (spec is not None and name == spec.get("method")):
-            return role
-    if name in STUDENT_ARMS:
-        raise ValueError(
-            f"teacher run named {name!r}: student-arm names require "
-            "--student; declare it as a reference or pass the checkpoint")
-    return "teacher_reference" if name == "teacher" else "warm_reference"
+def stable_seed(stage, scene, decision, anchor, direction):
+    payload = json.dumps([str(stage), int(scene), int(decision), int(anchor),
+                          int(direction)],
+                         separators=(",", ":"))
+    digest = hashlib.sha256(payload.encode()).digest()
+    return int.from_bytes(digest[:8], "big") % (2 ** 63)
 
 
-def canonical_choices(config, modes=None, seeds=None, updates=None, warm=None,
-                      cache=None, smoke_report=None, final_scenes=None,
-                      primary_contrast=None, compute=None, references=None,
-                      eval_noise=None, kind=None):
-    """Every experimental choice that must be part of the canonical identifier.
-
-    The final scene list, the primary contrast, the declared references, the
-    evaluation-noise schedule, and the resolved compute settings are
-    included: changing any of them without regenerating the lock changes the
-    identifier, so stale locks cannot be reused silently.
-    """
-    return dict(config_sha256=combined_id(config),
-                modes=None if modes is None else sorted(modes),
-                seeds=None if seeds is None else sorted(int(s) for s in seeds),
-                updates=None if updates is None else int(updates),
-                final_scenes=(None if final_scenes is None
-                              else sorted(int(s) for s in final_scenes)),
-                primary_contrast=(None if primary_contrast is None
-                                  else [str(primary_contrast[0]),
-                                        str(primary_contrast[1])]),
-                references=references,
-                eval_noise=eval_noise,
-                experiment_kind=kind,
-                compute=compute,
-                metric_mode=config.get("metric_mode", "exact"),
-                teacher_steps=int(config.get("teacher_steps", 0)),
-                source=config.get("source"),
-                warm_sha256=(sha256_file(warm) if warm and os.path.exists(warm)
-                             else "absent"),
-                cache_sha256=(sha256_file(cache) if cache and os.path.exists(cache)
-                              else "absent"),
-                smoke_report_sha256=(sha256_file(smoke_report)
-                                     if smoke_report and os.path.exists(smoke_report)
-                                     else "absent"))
-
-
-def protocol_id(config, config_path, cache_path, warm_path, modes, seeds, updates,
-                smoke_report=None, repository=None, final_scenes=None,
-                primary_contrast=None, compute=None, references=None,
-                eval_noise=None, kind=None):
-    repository = repository or config["repository"]
-    choices = canonical_choices(config, modes, seeds, updates, warm_path,
-                                cache_path, smoke_report,
-                                final_scenes=final_scenes,
-                                primary_contrast=primary_contrast,
-                                compute=compute, references=references,
-                                eval_noise=eval_noise, kind=kind)
-    parts = dict(config=source_hashes(),
-                 config_file=sha256_file(config_path),
-                 cache=sha256_file(cache_path),
-                 warm=sha256_file(warm_path) if warm_path and os.path.exists(warm_path) else "absent",
-                 smoke_report=(sha256_file(smoke_report)
-                               if smoke_report and os.path.exists(smoke_report)
-                               else "absent"),
-                 assets=asset_hashes(config),
-                 upstream=upstream_hashes(repository),
-                 upstream_commit=upstream_commit(repository),
-                 choices=choices,
-                 resolved=config)
-    return combined_id(parts), parts
+def scene_range(config, split):
+    if split not in SCENE_RANGES:
+        raise ProtocolError(f"unknown split {split!r}; "
+                            f"known: {sorted(SCENE_RANGES)}")
+    start_key, count_key = SCENE_RANGES[split]
+    return set(range(int(config[start_key]),
+                     int(config[start_key]) + int(config[count_key])))
 
 
 def validate_config(config, config_path="config.json"):
@@ -339,100 +142,151 @@ def validate_config(config, config_path="config.json"):
         value = config[key]
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             errors.append(f"{key} must be a positive integer, got {value!r}")
-    if not errors:
-        if config["teacher_steps"] < 2 or config["teacher_steps"] % 2 != 0:
-            errors.append("teacher_steps must be an even integer >= 2")
-        if not 1 <= config["execute_steps"] <= 16:
-            errors.append("execute_steps must satisfy 1 <= execute_steps <= 16")
-        if config["batch_size"] % 2 != 0:
-            errors.append("batch_size must be even to split marked and unmarked halves")
-        if config["native_fast_steps"] < 1:
-            errors.append("native_fast_steps must be >= 1")
-    epsilon = config.get("finite_difference_epsilon")
-    if epsilon is None or not np.isfinite(epsilon) or epsilon <= 0:
-        errors.append("finite_difference_epsilon must be positive and finite")
-    for key in ("metric_weight", "anchor_weight"):
-        value = config.get(key)
-        if value is None or not np.isfinite(value) or value < 0:
-            errors.append(f"{key} must be finite and >= 0")
+    rho = config.get("rho")
+    if rho is None or not np.isfinite(rho) or rho <= 0:
+        errors.append(f"rho must be positive and finite, got {rho!r}")
+    betas = config.get("betas")
+    if (not isinstance(betas, (list, tuple)) or not betas
+            or any(not np.isfinite(b) or b < 0 for b in betas)):
+        errors.append(f"betas must be a nonempty list of finite values >= 0, "
+                      f"got {betas!r}")
     lr = config.get("learning_rate")
     if lr is None or not np.isfinite(lr) or lr <= 0:
         errors.append("learning_rate must be positive and finite")
     wd = config.get("weight_decay")
     if wd is None or not np.isfinite(wd) or wd < 0:
         errors.append("weight_decay must be finite and >= 0")
-    for key in ("source", "native_fast_source"):
-        if config.get(key) not in ("gaussian", "uniform", "uniform_symmetric"):
-            errors.append(f"{key} must be gaussian, uniform, or uniform_symmetric")
-    if config.get("metric_mode", "exact") not in ("exact", "sketch"):
-        errors.append("metric_mode must be exact or sketch")
-    for key in ("train_scene_start", "validation_scene_start",
-                "development_scene_start", "test_scene_start"):
-        if not isinstance(config.get(key), int):
-            errors.append(f"{key} must be an integer")
+    arms = config.get("arms")
+    if (not isinstance(arms, (list, tuple)) or not arms
+            or any(a not in ALLOWED_ARMS for a in arms)):
+        errors.append(f"arms must be a nonempty subset of "
+                      f"{sorted(ALLOWED_ARMS)}, got {arms!r}")
+    corr = config.get("correction") or {}
+    for key in ("lrs", "budgets"):
+        if key not in corr:
+            errors.append("missing correction key " + key)
+    budgets = corr.get("budgets", None)
+    if (not isinstance(budgets, (list, tuple)) or
+            any(not isinstance(b, int) or isinstance(b, bool) or b < 0
+                for b in (budgets or []))):
+        errors.append(f"correction.budgets must be nonnegative ints, "
+                      f"got {budgets!r}")
     for key in ("checkpoint", "normalizer", "repository"):
         if not config.get(key):
             errors.append("missing path key " + key)
-    errors.extend(validate_split_ranges(config)["errors"])
+    for key in ("development_scene_start", "train_scene_start",
+                "validation_scene_start", "diagnostic_scene_start",
+                "final_scene_start"):
+        if not isinstance(config.get(key), int) or isinstance(config.get(key), bool):
+            errors.append(f"{key} must be an integer")
+    if not errors:
+        sets = {name: scene_range(config, name) for name in SCENE_RANGES}
+        names = sorted(sets)
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                overlap = sorted(sets[a] & sets[b])
+                if overlap:
+                    errors.append(f"{a} and {b} scene ranges overlap: "
+                                  f"{overlap[:5]}")
     if errors:
-        raise ValueError("invalid configuration " + config_path + ": " +
+        raise ValueError("invalid configuration " + str(config_path) + ": " +
                          "; ".join(errors))
     return True
 
 
-def scene_range(config, split):
-    start_key, count_key = SCENE_RANGES[split]
-    start = int(config[start_key])
-    return set(range(start, start + int(config[count_key])))
+# ---------------------------------------------------------------------------
+# Artifact reservation / completion
+# ---------------------------------------------------------------------------
+
+def _needs_sidecar(path):
+    return str(path).endswith(SIDECAR_REQUIRED)
 
 
-def validate_split_ranges(config):
-    sets = {name: scene_range(config, name) for name in SCENE_RANGES}
-    errors = []
-    names = sorted(sets)
-    for i, a in enumerate(names):
-        for b in names[i + 1:]:
-            overlap = sorted(sets[a] & sets[b])
-            if overlap:
-                errors.append(f"{a} and {b} scene ranges overlap: {overlap[:5]}")
-    return dict(sets=sets, errors=errors)
+def _is_self_describing(path):
+    return str(path).endswith(SELF_DESCRIBING)
 
 
-def validate_scene_sets(scene_records):
-    seen = {}
-    errors = []
-    for split, scenes in scene_records.items():
-        for scene in scenes:
-            scene = int(scene)
-            if scene in seen and seen[scene] != split:
-                errors.append(f"scene {scene} appears in {seen[scene]} and {split}")
-            seen[scene] = split
-    if errors:
-        raise ValueError("scene split overlap: " + "; ".join(errors))
-    return True
+def reserve_outputs(paths):
+    """Exclusively reserve output paths (create sibling .reserved files).
+
+    Refuses when the data file, its .complete.json, or its .reserved file
+    already exists, so two processes can never share one artifact.
+    """
+    for path in paths:
+        if os.path.exists(path) or os.path.exists(path + COMPLETION_SUFFIX) \
+                or os.path.exists(path + RESERVED_SUFFIX):
+            raise ProtocolError(f"output already exists or reserved: {path}")
+    for path in paths:
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        handle = os.open(path + RESERVED_SUFFIX, flags)
+        with os.fdopen(handle, "w") as stream:
+            json.dump({"path": path,
+                       "schema_version": SCHEMA_VERSION}, stream)
 
 
-def split_of_scene(config, scene):
-    scene = int(scene)
-    for name in SCENE_RANGES:
-        if scene in scene_range(config, name):
-            return name
-    raise ValueError(f"scene {scene} is not inside any configured split range")
+def complete_output(path, role=None, protocol=None):
+    """Mark an artifact complete: record sha256+bytes in <path>.complete.json."""
+    if not os.path.exists(path):
+        raise ProtocolError(f"cannot complete missing artifact: {path}")
+    if os.path.exists(path + COMPLETION_SUFFIX):
+        raise ProtocolError(f"artifact already completed: {path}")
+    sidecar = {"sha256": sha256_file(path),
+               "bytes": int(os.path.getsize(path)),
+               "schema_version": SCHEMA_VERSION}
+    if role is not None:
+        sidecar["role"] = role
+    if protocol is not None:
+        sidecar["protocol"] = protocol
+    _atomic_json(path + COMPLETION_SUFFIX, sidecar)
+    for suffix in (RESERVED_SUFFIX, INCOMPLETE_SUFFIX):
+        try:
+            if os.path.exists(path + suffix):
+                os.remove(path + suffix)
+        except FileNotFoundError:
+            pass
+    return sidecar
 
 
-def cache_fingerprint(config, repository=None, extra=None):
-    repository = repository or config["repository"]
-    fingerprint = {key: config.get(key) for key in CACHE_FINGERPRINT_KEYS}
-    fingerprint["schema_version"] = SCHEMA_VERSION
-    fingerprint["upstream"] = upstream_hashes(repository)
-    fingerprint["upstream_commit"] = upstream_commit(repository)
-    fingerprint["assets"] = asset_hashes(config)
-    fingerprint["teacher_checkpoint"] = fingerprint["assets"].get("checkpoint")
-    fingerprint["normalizer"] = fingerprint["assets"].get("normalizer")
-    fingerprint["feature_version"] = 1
-    if extra:
-        fingerprint.update(extra)
-    return fingerprint
+def mark_incomplete(path, reason):
+    _atomic_json(path + INCOMPLETE_SUFFIX,
+                 {"path": path, "reason": str(reason),
+                  "schema_version": SCHEMA_VERSION})
+
+
+def is_complete(path):
+    return os.path.exists(path + COMPLETION_SUFFIX)
+
+
+def verify_completed(path, role=None, protocol=None):
+    """Verify a completed artifact against its sidecar.
+
+    Error codes: MISSING_HASH (no sidecar where required), ARTIFACT_HASH_MISMATCH,
+    SIDECAR_MISMATCH (size drift), ROLE_MISMATCH, PROTOCOL_MISMATCH.
+    """
+    sidecar_path = path + COMPLETION_SUFFIX
+    if not os.path.exists(path):
+        raise ProtocolError(f"MISSING_HASH: artifact absent: {path}")
+    if _is_self_describing(path):
+        return {"path": path, "self_describing": True,
+                "sha256": sha256_file(path)}
+    if not _needs_sidecar(path):
+        return {"path": path, "sha256": sha256_file(path)}
+    if not os.path.exists(sidecar_path):
+        raise ProtocolError(f"MISSING_HASH: no completion sidecar for {path}")
+    with open(sidecar_path) as handle:
+        sidecar = json.load(handle)
+    actual_hash = sha256_file(path)
+    if sidecar.get("sha256") != actual_hash:
+        raise ProtocolError(f"ARTIFACT_HASH_MISMATCH: {path}")
+    if int(sidecar.get("bytes", -1)) != int(os.path.getsize(path)):
+        raise ProtocolError(f"SIDECAR_MISMATCH: byte count drift for {path}")
+    if role is not None and sidecar.get("role") != role:
+        raise ProtocolError(f"ROLE_MISMATCH: expected {role!r}, sidecar has "
+                            f"{sidecar.get('role')!r} for {path}")
+    if protocol is not None and sidecar.get("protocol") != protocol:
+        raise ProtocolError(f"PROTOCOL_MISMATCH: locked protocol differs for "
+                            f"{path}")
+    return sidecar
 
 
 def _atomic_json(path, payload):
@@ -446,798 +300,377 @@ def _atomic_json(path, payload):
         handle.close()
         os.replace(handle.name, path)
     except Exception:
-        handle.close()
-        if os.path.exists(handle.name):
+        try:
+            handle.close()
+        except Exception:
+            pass
+        try:
             os.remove(handle.name)
+        except Exception:
+            pass
         raise
-    return path
 
 
 def write_meta(path, payload):
-    return _atomic_json(path, payload)
+    _atomic_json(path, dict(payload, schema_version=SCHEMA_VERSION))
 
+
+# ---------------------------------------------------------------------------
+# Atomic tensor saves (state dicts only, never pickled modules)
+# ---------------------------------------------------------------------------
 
 def atomic_savez(path, **arrays):
+    import numpy as _np
+    for key, value in arrays.items():
+        if not isinstance(value, _np.ndarray):
+            raise ProtocolError(f"atomic_savez {path}: {key} is not ndarray")
+        if not _np.isfinite(value).all():
+            raise ProtocolError(f"atomic_savez {path}: nonfinite {key}")
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile("wb", dir=directory, delete=False,
-                                         suffix=".npz")
+    handle = tempfile.NamedTemporaryFile(suffix=".npz", dir=directory,
+                                         delete=False)
     handle.close()
     try:
-        np.savez(handle.name, **arrays)
+        _np.savez(handle.name, **arrays)
         os.replace(handle.name, path)
     except Exception:
-        if os.path.exists(handle.name):
-            os.remove(handle.name)
-        raise
-    return path
-
-
-def atomic_save_torch(path, payload):
-    import torch
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    os.makedirs(directory, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile("wb", dir=directory, delete=False,
-                                         suffix=".pt")
-    handle.close()
-    try:
-        torch.save(payload, handle.name)
-        os.replace(handle.name, path)
-    except Exception:
-        if os.path.exists(handle.name):
-            os.remove(handle.name)
-        raise
-    return path
-
-
-def reserve_outputs(paths):
-    """Reserve output paths by creating a `.reserved` claim file.
-
-    Existence of the data file is not enough information: a partial artifact or a
-    crashed run must also block reuse. The claim is replaced by a completion
-    record when the producer finishes, and by an `.incomplete` marker on failure.
-    Claims are created exclusively (O_EXCL): two concurrent writers cannot both
-    hold the same output.
-    """
-    paths = [p for p in paths if p]
-    taken = []
-    for path in paths:
-        for marker in (path, path + ".reserved", path + ".incomplete"):
-            if os.path.exists(marker):
-                taken.append(marker)
-    if taken:
-        raise ValueError("output already exists or is reserved, refusing to "
-                         "overwrite: " + ", ".join(sorted(taken)))
-    for path in paths:
-        parent = os.path.dirname(os.path.abspath(path)) or "."
-        os.makedirs(parent, exist_ok=True)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         try:
-            handle = os.open(path + ".reserved", flags)
-        except FileExistsError:
-            raise ValueError("output claimed by a concurrent writer: " + path)
-        with os.fdopen(handle, "w") as stream:
-            stream.write(json.dumps(dict(state="reserved")))
-    return paths
+            os.remove(handle.name)
+        except Exception:
+            pass
+        raise
 
 
-def complete_output(path, payload=None):
-    detail = dict(payload or {})
-    if os.path.exists(path):
-        detail.setdefault("sha256", sha256_file(path))
-        detail.setdefault("bytes", os.path.getsize(path))
-    else:
-        detail.setdefault("bytes", 0)
-    _atomic_json(path + COMPLETION_SUFFIX,
-                 dict(state="complete", artifact=os.path.basename(path),
-                      detail=detail))
-    for marker in (path + ".reserved", path + ".incomplete"):
-        if os.path.exists(marker):
-            os.remove(marker)
-    return path + COMPLETION_SUFFIX
-
-
-def mark_incomplete(path, reason):
-    parent = os.path.dirname(os.path.abspath(path)) or "."
-    os.makedirs(parent, exist_ok=True)
-    _atomic_json(path + ".incomplete", dict(state="incomplete", reason=str(reason)))
-    for marker in (path + ".reserved", path + COMPLETION_SUFFIX):
-        if os.path.exists(marker):
-            os.remove(marker)
-    return path + ".incomplete"
-
-
-def is_complete(path):
-    record = path + COMPLETION_SUFFIX
-    if not os.path.exists(record):
-        return False
+def atomic_save_torch(path, state_dict):
+    import torch as _torch
+    if not isinstance(state_dict, dict):
+        raise ProtocolError("atomic_save_torch requires a state dict, "
+                            "never a pickled module")
+    for key, value in state_dict.items():
+        if not isinstance(value, _torch.Tensor):
+            raise ProtocolError(f"atomic_save_torch {path}: {key} is not "
+                                "a Tensor; refusing to pickle modules")
+        if not _torch.isfinite(value).all():
+            raise ProtocolError(f"atomic_save_torch {path}: nonfinite {key}")
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(suffix=".pt", dir=directory,
+                                         delete=False)
+    handle.close()
     try:
-        with open(record) as handle:
-            return json.load(handle).get("state") == "complete"
+        _torch.save(state_dict, handle.name)
+        os.replace(handle.name, path)
     except Exception:
-        return False
+        try:
+            os.remove(handle.name)
+        except Exception:
+            pass
+        raise
 
 
-def verify_completed(path, role=None, protocol=None):
-    """Verify a skipped artifact before reuse: completion record, existence,
-    byte hash, role, and protocol binding.
+# ---------------------------------------------------------------------------
+# History cache and pair bank (with lineage)
+# ---------------------------------------------------------------------------
 
-    Runners must call this instead of trusting marker existence.
-    """
-    record = path + COMPLETION_SUFFIX
-    if not os.path.exists(record):
-        raise ValueError(f"{path} has no completion record; rebuild it")
-    with open(record) as handle:
-        marker = json.load(handle)
-    if marker.get("state") != "complete":
-        raise ValueError(f"{path} completion state is {marker.get('state')!r}")
-    if not os.path.exists(path):
-        raise ValueError(f"{path} completed but the artifact is missing")
-    recorded = (marker.get("detail") or {}).get("sha256")
-    if not recorded:
-        raise ValueError(f"MISSING_HASH: {path} completion record carries "
-                         "no artifact hash (pre-schema artifact); rebuild it "
-                         "rather than backfilling a hash")
-    if sha256_file(path) != recorded:
-        raise ValueError(f"ARTIFACT_HASH_MISMATCH: {path} bytes differ from "
-                         "its completion record; rebuild it")
-    _verify_artifact_sidecar(path)
-    if role is not None:
-        kind = ((marker.get("detail") or {}).get("kind")
-                or _sidecar_kind(path))
-        if kind is not None and kind != role:
-            raise ValueError(f"ROLE_MISMATCH: {path} is a {kind} artifact, "
-                             f"not {role}")
-    if protocol is not None:
-        locked_id = protocol.get("protocol_id")
-        artifact_protocol = ((marker.get("detail") or {}).get("protocol_id")
-                             or _sidecar_protocol(path))
-        if locked_id and artifact_protocol and artifact_protocol != locked_id:
-            raise ValueError(f"PROTOCOL_MISMATCH: {path} belongs to protocol "
-                             f"{artifact_protocol}, not the locked "
-                             f"{locked_id}")
-    return True
+def cache_fingerprint(config, repository=None):
+    fingerprint = {"schema_version": SCHEMA_VERSION,
+                   "source": config.get("canonical_source"),
+                   "teacher_steps": config.get("teacher_steps"),
+                   "execute_steps": config.get("execute_steps"),
+                   "episode_steps": config.get("episode_steps"),
+                   "rho": config.get("rho"),
+                   "betas": config.get("betas"),
+                   "anchors_per_history": config.get("anchors_per_history"),
+                   "directions_per_anchor": config.get("directions_per_anchor"),
+                   "legacy": config.get("legacy"),
+                   "repository": repository or config.get("repository"),
+                   "train_scene_start": config.get("train_scene_start"),
+                   "train_episodes": config.get("train_episodes"),
+                   "validation_scene_start": config.get("validation_scene_start"),
+                   "validation_episodes": config.get("validation_episodes"),
+                   "development_scene_start": config.get("development_scene_start"),
+                   "development_episodes": config.get("development_episodes"),
+                   "diagnostic_scene_start": config.get("diagnostic_scene_start"),
+                   "diagnostic_episodes": config.get("diagnostic_episodes"),
+                   "final_scene_start": config.get("final_scene_start"),
+                   "final_episodes": config.get("final_episodes")}
+    fingerprint["sources"] = source_hashes()
+    fingerprint["assets"] = asset_hashes(config)
+    return fingerprint
 
 
-def _sidecar_path(path):
-    if path.endswith(".jsonl"):
-        return path.replace(".jsonl", ".meta.json")
-    return path + ".meta.json"
-
-
-def _sidecar_field(path, field):
-    sidecar = _sidecar_path(path)
-    if not os.path.exists(sidecar):
-        return None
-    try:
-        with open(sidecar) as handle:
-            return json.load(handle).get(field)
-    except Exception:
-        return None
-
-
-def _sidecar_kind(path):
-    return _sidecar_field(path, "kind")
-
-
-def _sidecar_protocol(path):
-    return _sidecar_field(path, "protocol_id")
-
-
-def _verify_artifact_sidecar(path):
-    sidecar = _sidecar_path(path)
-    if not os.path.exists(sidecar):
-        raise ValueError(f"SIDECAR_MISMATCH: {path} has no sidecar "
-                         f"{sidecar}; rebuild it")
-    if not path.endswith(".jsonl"):
-        return True
-    try:
-        with open(sidecar) as handle:
-            meta = json.load(handle)
-    except Exception as error:
-        raise ValueError(f"SIDECAR_MISMATCH: {sidecar} unreadable: {error}")
-    with open(path) as handle:
-        n_rows = sum(1 for line in handle if line.strip())
-    scenes = meta.get("scenes")
-    if scenes is not None and len(scenes) != n_rows:
-        raise ValueError(f"SIDECAR_MISMATCH: {sidecar} lists {len(scenes)} "
-                         f"scenes for {n_rows} rows; rebuild the evaluation")
-    return True
-
-
-def check_manifest():
-    here = experiment_dir()
-    missing = [name for name in SOURCE_FILES
-               if not os.path.exists(os.path.join(here, name))]
-    tracked, untracked = [], []
-    repo = None
-    try:
-        out = subprocess.run(["git", "-C", os.path.dirname(here),
-                              "rev-parse", "--show-toplevel"],
-                             capture_output=True, text=True, timeout=30)
-        if out.returncode == 0:
-            repo = out.stdout.strip()
-    except Exception:
-        repo = None
-    if repo:
-        listing = subprocess.run(["git", "-C", repo, "ls-files", here],
-                                 capture_output=True, text=True, timeout=30)
-        names = {os.path.basename(p) for p in listing.stdout.split()}
-        for name in SOURCE_FILES:
-            (tracked if name in names else untracked).append(name)
-        check = subprocess.run(["git", "-C", repo, "check-ignore"] +
-                               [os.path.join(here, n) for n in untracked],
-                               capture_output=True, text=True)
-        ignored = {os.path.basename(line) for line in check.stdout.split()}
-        return dict(dir=here, source=repo, missing=missing, tracked=sorted(tracked),
-                    untracked=sorted(untracked), ignored=sorted(ignored),
-                    complete=not missing, delivery_risk=sorted(set(untracked)),
-                    note=("commit or archive every file in delivery_risk; a git "
-                          "transfer of tracked files alone is insufficient"))
-    return dict(dir=here, source="no_git", missing=missing, tracked=[],
-                untracked=list(SOURCE_FILES), ignored=[], complete=not missing,
-                delivery_risk=list(SOURCE_FILES),
-                note=("no git repository here; ship the explicit manifest and "
-                      "verify it after transfer"))
-
-
-def write_manifest(path, experiment_dir_override=None):
-    here = experiment_dir_override or experiment_dir()
-    entries = {name: sha256_file(os.path.join(here, name)) for name in SOURCE_FILES}
-    payload = dict(schema_version=SCHEMA_VERSION,
-                   experiment=os.path.basename(os.path.dirname(here)),
-                   dir=here, files=entries, count=len(entries),
-                   packages=package_versions())
+def write_history_cache(path, contexts, config, repository=None):
+    for context in contexts:
+        missing = [k for k in HISTORY_CONTEXT_KEYS if k not in context]
+        if missing:
+            raise ProtocolError(f"history context missing keys {missing}")
+    payload = {"schema_version": SCHEMA_VERSION,
+               "fingerprint": cache_fingerprint(config, repository),
+               "histories": list(contexts)}
     _atomic_json(path, payload)
     return payload
 
 
-def verify_manifest(path, experiment_dir_override=None):
+def _as_float_array(value, name):
+    import numpy as _np
+    arr = _np.asarray(value, dtype=_np.float32)
+    if not _np.isfinite(arr).all():
+        raise ProtocolError(f"nonfinite {name} in cache record")
+    return arr
+
+
+def verify_history_cache(path, config, repository=None):
     with open(path) as handle:
         payload = json.load(handle)
-    here = experiment_dir_override or experiment_dir()
-    problems = []
-    for name, digest in payload["files"].items():
-        target = os.path.join(here, name)
-        if not os.path.exists(target):
-            problems.append(f"missing {name}")
-        elif sha256_file(target) != digest:
-            problems.append(f"modified {name}")
-    if problems:
-        raise ValueError("delivered manifest does not match: " + "; ".join(problems))
-    return dict(verified=len(payload["files"]), dir=here)
-
-
-
-def write_label_cache(path, contexts, config, meta, lineage, extra=None):
-    """Producer-side schema writer, shared by collection and the schema test."""
-    fingerprint = cache_fingerprint(config, config.get("repository"),
-                                    extra=dict(source=meta.get("source"),
-                                               has_labels=True, has_metrics=False,
-                                               **(extra or {})))
-    atomic_savez(path, contexts=np.array(contexts, dtype=object),
-                 meta=json.dumps(meta), fingerprint=json.dumps(fingerprint),
-                 lineage=json.dumps(lineage))
-    write_meta(path + ".meta.json", dict(meta, fingerprint=fingerprint,
-                                         lineage=lineage))
-    return fingerprint
-
-
-def write_metric_cache(path, contexts, config, meta, lineage):
-    fingerprint = cache_fingerprint(
-        config, config.get("repository"),
-        extra=dict(source=meta.get("source"), has_labels=True, has_metrics=True,
-                   metric_mode=meta.get("metric_mode"),
-                   num_probes=config.get("num_probes")))
-    atomic_savez(path, contexts=np.array(contexts, dtype=object),
-                 meta=json.dumps(meta), fingerprint=json.dumps(fingerprint),
-                 lineage=json.dumps(lineage))
-    write_meta(path + ".meta.json", dict(meta, fingerprint=fingerprint,
-                                         lineage=lineage))
-    return fingerprint
-
-
-def verify_tensors(arrays, where):
-    for name, value in arrays.items():
-        if value is None:
+    if payload.get("schema_version") != SCHEMA_VERSION:
+        raise ProtocolError("history cache schema mismatch")
+    expected = cache_fingerprint(config, repository)
+    actual = payload.get("fingerprint", {})
+    for key, value in expected.items():
+        if key in ("sources", "assets"):
             continue
-        if not np.isfinite(np.asarray(value, dtype=np.float64)).all():
-            raise ValueError(f"nonfinite values in {where}:{name}")
-    return True
-
-
-def _load_cache(path):
-    data = np.load(path, allow_pickle=True)
-    if "contexts" not in data:
-        raise ValueError(
-            f"cache {path} lacks a top-level `contexts` array; schema v{SCHEMA_VERSION} "
-            "writes flattened contexts (rebuild the cache with this version)")
-    payload = dict(contexts=list(data["contexts"]))
-    for key in ("meta", "fingerprint", "lineage"):
-        payload[key] = (json.loads(str(data[key])) if key in data else None)
+        if actual.get(key) != value:
+            raise ProtocolError(f"history cache fingerprint drift at {key}")
+    if actual.get("sources") != expected.get("sources"):
+        raise ProtocolError("history cache source drift")
+    if actual.get("assets") != expected.get("assets"):
+        raise ProtocolError("history cache asset drift")
+    for context in payload.get("histories", []):
+        missing = [k for k in HISTORY_CONTEXT_KEYS if k not in context]
+        if missing:
+            raise ProtocolError(f"history context missing keys {missing}")
+        for key in ("condition", "endpoint"):
+            context[key] = _as_float_array(context[key], key)
+        context["history"] = [list(map(float, row))
+                              for row in context["history"]]
     return payload
 
 
-def load_cache(path):
-    return _load_cache(path)
+def _to_list(value):
+    import numpy as _np
+    if isinstance(value, _np.ndarray):
+        return value.astype(_np.float64).tolist()
+    if isinstance(value, (list, tuple)):
+        return [ _to_list(v) for v in value ]
+    return value
 
 
-def _check_fingerprint(stored, expected, kind):
-    if stored is None:
-        raise ValueError(f"{kind} lacks a contract fingerprint; rebuild it")
-    mismatch = {k: {"cached": stored.get(k), "expected": v}
-                for k, v in expected.items() if stored.get(k) != v}
-    if mismatch:
-        raise ValueError(f"{kind} contract mismatch: " +
-                         json.dumps(mismatch, default=str))
-
-
-def verify_label_cache(path_or_data, config, expect_mode=None,
-                       allowed_scenes=None, require_metric=False):
-    """Validate a flattened cache produced by `pilot.py collect`.
-
-    Label caches carry the two teacher targets and the teacher endpoint, which is
-    everything `uniform` and `prefix` training need. Metric caches additionally
-    carry the physical Jacobians and the transported metric.
-    """
-    data = _load_cache(path_or_data) if isinstance(path_or_data, str) else path_or_data
-    contexts = data["contexts"]
-    if not contexts:
-        raise ValueError("cache is empty")
-    _check_fingerprint(data["fingerprint"], cache_fingerprint(config),
-                       "cache")
-    meta = data["meta"] or {}
-    if meta.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError(f"cache schema {meta.get('schema_version')} != "
-                         f"{SCHEMA_VERSION}; rebuild the cache")
-    lineage = data.get("lineage") or {}
-    if lineage.get("source_hashes") != source_hashes():
-        raise ValueError("cache was built by different experiment sources "
-                         "(collection/normalization/metric implementation "
-                         "changed); rebuild it rather than reusing old data")
-    if lineage.get("epsilon") != config.get("finite_difference_epsilon") and \
-            require_metric:
-        raise ValueError("metric cache epsilon differs from the configuration; "
-                         "rebuild it")
-    if expect_mode and meta.get("mode") != expect_mode:
-        raise ValueError(f"cache mode {meta.get('mode')!r} != expected {expect_mode!r}")
-    metric_key = "metric_exact" if config.get("metric_mode", "exact") == "exact" \
-        else "probes"
-    splits = {}
-    metric_rows = 0
-    for index, context in enumerate(contexts):
-        missing = [k for k in CONTEXT_LABEL_KEYS + ["scene", "split", "history"]
-                   if k not in context]
+def write_pair_bank(path, records, meta, config, lineage=None):
+    serial = []
+    for record in records:
+        missing = [k for k in PAIR_RECORD_KEYS if k not in record]
         if missing:
-            raise ValueError(f"cache context {index} missing {missing}")
-        has_metric = context.get("has_metric", metric_key in context)
-        if has_metric:
-            metric_rows += 1
-            missing = [k for k in CONTEXT_METRIC_KEYS + [metric_key]
-                       if k not in context]
-            if missing:
-                raise ValueError(f"metric cache context {index} missing {missing}")
-        scene = int(context["scene"])
-        expected_split = split_of_scene(config, scene)
-        if context["split"] != expected_split:
-            raise ValueError(f"cache context {index}: scene {scene} labelled "
-                             f"{context['split']!r} but is in {expected_split!r}")
-        if allowed_scenes is not None and scene not in allowed_scenes:
-            raise ValueError(f"cache contains unplanned scene {scene}")
-        splits.setdefault(context["split"], 0)
-        splits[context["split"]] += 1
-        verify_tensors({k: np.asarray(context[k]) for k in CONTEXT_LABEL_KEYS},
-                       f"cache context {index}")
-        if has_metric:
-            verify_tensors({k: np.asarray(context[k]) for k in
-                            CONTEXT_METRIC_KEYS + [metric_key]},
-                           f"metric cache context {index}")
-        if context.get("history"):
-            verify_tensors({"history": np.asarray(context["history"], dtype=np.float64)},
-                           f"cache context {index}")
-        for key, shape in (("condition", (514,)), ("noise", (16, 2)),
-                           ("midpoint", (16, 2)), ("target_mid", (16, 2)),
-                           ("target_end", (16, 2)), ("teacher_end", (16, 2))):
-            actual_shape = tuple(np.asarray(context[key]).shape)
-            if actual_shape != shape:
-                raise ValueError(f"cache context {index}: {key} shape "
-                                 f"{actual_shape} != {shape}; rebuild the cache")
-        if has_metric:
-            phys, prefix = 4 * config["execute_steps"], config["execute_steps"] * 2
-            for key, shape in (("jacobian_start", (phys, prefix)),
-                               ("jacobian_end", (phys, prefix))):
-                actual_shape = tuple(np.asarray(context[key]).shape)
-                if actual_shape != shape:
-                    raise ValueError(f"metric cache context {index}: {key} shape "
-                                     f"{actual_shape} != {shape}; rebuild it")
-    if require_metric and not metric_rows:
-        raise ValueError("metric cache holds no has_metric rows; "
-                         "run the metrics stage before metric training")
-    return dict(contexts=contexts, meta=meta, lineage=data.get("lineage") or {},
-                splits=splits,
-                scenes=sorted({int(c["scene"]) for c in contexts}),
-                n_contexts=len(contexts), n_metric=metric_rows)
+            raise ProtocolError(f"pair record missing keys {missing}")
+        serial.append({k: _to_list(record[k]) for k in PAIR_RECORD_KEYS})
+    missing_meta = [k for k in PAIR_META_KEYS if k not in meta]
+    if missing_meta:
+        raise ProtocolError(f"pair bank meta missing keys {missing_meta}")
+    if float(meta.get("rho", -1)) != float(config.get("rho")):
+        raise ProtocolError("pair bank rho does not match config")
+    if int(meta.get("teacher_steps", -1)) != int(config.get("teacher_steps")):
+        raise ProtocolError("pair bank teacher_steps do not match config")
+    payload = {"schema_version": SCHEMA_VERSION, "meta": dict(meta),
+               "lineage": dict(lineage or {}),
+               "records": serial}
+    _atomic_json(path, payload)
+    return payload
 
 
-def select_split(verified, split):
-    return [c for c in verified["contexts"] if c["split"] == split]
-
-
-def metric_rows(verified, config):
-    """Rows of a metric cache that carry physical metrics (the linked subset)."""
-    metric_key = "metric_exact" if config.get("metric_mode", "exact") == "exact" \
-        else "probes"
-    return [c for c in verified["contexts"]
-            if c.get("has_metric", metric_key in c)]
-
-
-def metric_subset(verified, config, limit=None, seed=915):
-    """Pick the fixed metric subset BEFORE any derivative work.
-
-    Rows are spread round-robin across scenes with a fixed seed, so the subset
-    cannot concentrate in the earliest collected episodes. The planned budget is
-    `metric_contexts` training rows plus `validation_metric_contexts` validation
-    rows. Set `limit` for a small profiling run.
-    """
-    train = select_split(verified, "train")
-    validation = select_split(verified, "validation")
-    if limit is not None:
-        if limit < 1:
-            raise ValueError("limit must be >= 1")
-        return train[:limit], []
-
-    def spread(rows, count):
-        if not rows or count < 1:
-            return []
-        by_scene = {}
-        for row in rows:
-            by_scene.setdefault(int(row["scene"]), []).append(row)
-        rng = np.random.default_rng(seed)
-        scenes = sorted(by_scene)
-        rng.shuffle(scenes)
-        picked = []
-        round_robin = [list(by_scene[s]) for s in scenes]
-        for group in round_robin:
-            rng.shuffle(group)
-        index = 0
-        while len(picked) < min(count, len(rows)):
-            for group in round_robin:
-                if index < len(group) and len(picked) < min(count, len(rows)):
-                    picked.append(group[index])
-            index += 1
-            if index > max(len(group) for group in round_robin):
-                break
-        return picked
-
-    return (spread(train, int(config["metric_contexts"])),
-            spread(validation, int(config["validation_metric_contexts"])))
-
-
-def verify_current_protocol(protocol, config, config_path, repository=None,
-                            require=True, stage="run"):
-    """Recompute every locked fingerprint and compare it with the lock.
-
-    Called by training, final evaluation, and analysis, so a lock cannot go stale
-    while work continues.
-    """
-    if protocol is None:
-        if require:
-            raise ProtocolError(f"no protocol lock for stage {stage}; "
-                                "development stages must pass --allow-unlocked")
-        return dict(verified=False, stage=stage, reason="no lock supplied")
-    problems = []
-    current_sources = source_hashes()
-    if protocol.get("source_hashes") != current_sources:
-        changed = sorted(set(protocol.get("source_hashes", {}).items()) ^
-                         set(current_sources.items()))
-        problems.append(f"experiment sources changed ({changed[:3]})")
-    repository = repository or config["repository"]
-    current_upstream = upstream_hashes(repository)
-    if protocol.get("upstream") != current_upstream:
-        problems.append("upstream implementation changed")
-    if protocol.get("upstream_commit") != upstream_commit(repository):
-        problems.append("upstream commit changed")
-    if protocol.get("resolved_config") != config:
-        problems.append("configuration differs from the lock")
-    current_assets = asset_hashes(config)
-    if protocol.get("assets") != current_assets:
-        problems.append("checkpoint or normalizer bytes changed")
-    for key in ("checkpoint", "normalizer"):
-        if protocol.get(key + "_sha256") not in (None, current_assets.get(key)):
-            problems.append(f"{key} hash differs from the lock")
-    current_packages = package_versions(list(protocol.get("packages", {}).keys()) or None)
-    if protocol.get("packages") and protocol["packages"] != current_packages:
-        differing = {k: (protocol["packages"].get(k), current_packages.get(k))
-                     for k in current_packages
-                     if protocol["packages"].get(k) != current_packages.get(k)}
-        problems.append(f"package versions differ ({differing})")
-    for name, key in (("smoke_report", "smoke_report_sha256"),
-                      ("cache", "cache_sha256"), ("warm_start", "warm_start_sha256")):
-        recorded = protocol.get(key)
-        path = protocol.get(name if name != "warm_start" else "warm_start")
-        if not recorded or not path:
-            problems.append(f"{name} is not recorded in the lock")
-        elif not os.path.exists(path):
-            problems.append(f"{name} is missing at {path}")
-        elif sha256_file(path) != recorded:
-            problems.append(f"{name} bytes differ from the lock")
-    canonical = protocol.get("canonical_choices")
-    if canonical is None:
-        problems.append("lock predates canonical-choice binding; regenerate it")
-    else:
-        rebuilt = combined_id(dict(
-            config=protocol.get("config", source_hashes()),
-            config_file=(sha256_file(config_path)
-                         if os.path.exists(config_path) else "absent"),
-            cache=protocol.get("cache_sha256"),
-            warm=protocol.get("warm_start_sha256"),
-            smoke_report=protocol.get("smoke_report_sha256"),
-            assets=protocol.get("assets", asset_hashes(config)),
-            upstream=protocol.get("upstream"),
-            upstream_commit=protocol.get("upstream_commit"),
-            choices=canonical,
-            resolved=protocol.get("resolved_config")))
-        if rebuilt != protocol.get("protocol_id"):
-            problems.append("lock payload was edited without regenerating the "
-                            "identifier (scenes, contrast, modes, seeds, "
-                            "updates, or compute changed)")
-        for field in ("modes", "seeds", "updates", "final_scenes",
-                      "primary_contrast"):
-            locked = protocol.get(field)
-            canon = canonical.get(field)
-            norm = (sorted(locked) if isinstance(locked, list)
-                    and field in ("modes", "seeds", "final_scenes") else locked)
-            if canon != norm:
-                problems.append(f"lock field {field} disagrees with the canonical "
-                                "payload; regenerate the lock")
-    if problems:
-        raise ProtocolError("protocol lock is stale for stage " + stage + ": " +
-                            "; ".join(problems))
-    return dict(verified=True, stage=stage, protocol_id=protocol.get("protocol_id"))
-
-
-def load_protocol(path, expect_id=None):
-    if not os.path.exists(path):
-        raise ProtocolError("protocol lock missing: " + path)
+def verify_pair_bank(path, config):
     with open(path) as handle:
-        protocol = json.load(handle)
-    if expect_id is not None and protocol.get("protocol_id") != expect_id:
-        raise ProtocolError(f"protocol id mismatch: {protocol.get('protocol_id')} "
-                            f"!= {expect_id}")
-    return protocol
+        payload = json.load(handle)
+    if payload.get("schema_version") != SCHEMA_VERSION:
+        raise ProtocolError("pair bank schema mismatch")
+    meta = payload.get("meta", {})
+    missing_meta = [k for k in PAIR_META_KEYS if k not in meta]
+    if missing_meta:
+        raise ProtocolError(f"pair bank meta missing keys {missing_meta}")
+    if float(meta.get("rho")) != float(config.get("rho")):
+        raise ProtocolError("pair bank rho does not match config")
+    if int(meta.get("teacher_steps")) != int(config.get("teacher_steps")):
+        raise ProtocolError("pair bank teacher_steps do not match config")
+    for record in payload.get("records", []):
+        missing = [k for k in PAIR_RECORD_KEYS if k not in record]
+        if missing:
+            raise ProtocolError(f"pair record missing keys {missing}")
+        for key in ("q", "u", "t0", "t1", "condition"):
+            record[key] = _as_float_array(record[key], key)
+        record["pair_id"] = list(record["pair_id"])
+        record["history_id"] = str(record["history_id"])
+        record["anchor_id"] = int(record["anchor_id"])
+        record["direction_id"] = int(record["direction_id"])
+        record["rho"] = float(record["rho"])
+        record["teacher_steps"] = int(record["teacher_steps"])
+    return payload
 
 
-def eval_noise_key(replicate, scene, decision):
-    import hashlib
-    raw = str(int(replicate)) + "/" + str(int(scene)) + "/" + str(int(decision))
-    return int(hashlib.sha256(raw.encode()).hexdigest()[:16], 16)
+# ---------------------------------------------------------------------------
+# Protocol lock, canonical design, student provenance
+# ---------------------------------------------------------------------------
+
+def upstream_commit(repository):
+    try:
+        out = subprocess.run(["git", "-C", repository, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=20)
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
 
 
-def check_compute_against_lock(stage, protocol, config, device=None):
-    locked = protocol.get("compute") or {}
-    runtime = apply_compute_env(device or config.get("device", "cuda"))
-    mismatches = []
-    for key in ("cudnn_disabled", "device", "torch_version"):
-        if locked.get(key) != runtime.get(key):
-            mismatches.append(key + ": locked " + repr(locked.get(key)) + " vs runtime " + repr(runtime.get(key)))
-    if mismatches:
-        raise ProtocolError(stage + ": compute settings differ from the lock: " + "; ".join(mismatches))
-    return runtime
+def canonical_design(config, modes, seeds, updates, arms, scenes,
+                     correction, beta_selected, rho, compute, references,
+                     warm=None, bank=None, cache=None):
+    design = {"schema_version": SCHEMA_VERSION,
+              "config": dict(config),
+              "modes": sorted(modes),
+              "seeds": sorted(int(s) for s in seeds),
+              "updates": int(updates),
+              "arms": sorted(arms),
+              "scenes": {k: sorted(int(s) for s in v)
+                         for k, v in sorted(scenes.items())},
+              "correction": correction,
+              "beta_selected": float(beta_selected),
+              "rho": float(rho),
+              "compute": compute,
+              "references": references,
+              "warm_sha256": (sha256_file(warm)
+                              if warm and os.path.exists(warm) else "absent"),
+              "bank_sha256": (sha256_file(bank)
+                              if bank and os.path.exists(bank) else "absent"),
+              "cache_sha256": (sha256_file(cache)
+                               if cache and os.path.exists(cache) else "absent")}
+    design["design_id"] = combined_id(design)
+    return design
 
 
-def validate_eval_row_role(row, protocol):
-    role = row.get("eval_role")
-    if role not in EVAL_ROLES:
-        raise ValueError("evaluation row lacks a valid eval_role")
-    if role == "student" and not row.get("checkpoint_sha256"):
-        raise ValueError("student evaluation row without a checkpoint hash")
-    return True
+def design_id(design):
+    body = {k: v for k, v in design.items() if k != "design_id"}
+    return combined_id(body)
 
 
-def validate_reference_rows(rows, spec, protocol):
-    expected = {(int(s), int(spec.get("replicate", 0))) for s in spec.get("scenes", [])}
-    keys = [(int(r.get("scene")), int(r.get("eval_replicate", 0))) for r in rows]
-    if len(keys) != len(set(keys)):
-        dupes = sorted({k for k in keys if keys.count(k) > 1})
-        raise ValueError("reference duplicate episodes " + repr(dupes[:5]))
-    if set(keys) != expected:
-        raise ValueError("reference episodes differ from the declared scenes: " + repr(sorted(set(keys) ^ expected)[:5]))
-    for row in rows:
-        for field in ("source", "teacher_steps", "checkpoint_sha256"):
-            want = spec.get(field)
-            if want is not None and row.get(field) != want:
-                raise ValueError("reference row " + field + " mismatch: " + repr(row.get(field)) + " != " + repr(want))
-        validate_eval_row_role(row, protocol)
-    return True
+def load_protocol(path):
+    with open(path) as handle:
+        return json.load(handle)
 
 
-def verify_student_provenance(payload, protocol, config, path, role="final"):
-    """A checkpoint must belong to the active protocol and its own metadata.
+def verify_current_protocol(protocol, config, config_path, repository=None):
+    repository = repository or config.get("repository")
+    if protocol.get("schema_version") != SCHEMA_VERSION:
+        raise ProtocolError("protocol schema mismatch")
+    if protocol.get("sources") != source_hashes():
+        raise ProtocolError("PROTOCOL_MISMATCH: source files changed")
+    if protocol.get("config_file") != sha256_file(config_path):
+        raise ProtocolError("PROTOCOL_MISMATCH: config file changed")
+    if protocol.get("assets") != asset_hashes(config):
+        raise ProtocolError("PROTOCOL_MISMATCH: assets changed")
+    if protocol.get("packages") != package_versions():
+        raise ProtocolError("PROTOCOL_MISMATCH: package set changed")
+    recomputed = None
+    design = protocol.get("design")
+    if design is not None:
+        recomputed = design_id(design)
+        if recomputed != design.get("design_id"):
+            raise ProtocolError("PROTOCOL_MISMATCH: canonical design id "
+                                "does not recompute")
+    for key in ("artifacts",):
+        for entry in (protocol.get(key) or {}).values():
+            ref = entry if isinstance(entry, str) else entry.get("path", entry)
+            if isinstance(ref, str) and os.path.exists(ref):
+                verify_completed(ref)
+    return {"design_id": recomputed,
+            "upstream_commit": upstream_commit(repository)}
 
-    Roles are validated separately:
-    - "init": the file itself must be the locked warm start (hash equality
-      with warm_start_sha256). Mode labels are never trusted.
-    - "final": full match on protocol id, mode, seed, updates, cache hash,
-      and initialization hash.
-    - "reference": evaluating a warm-start checkpoint as a behavioral
-      reference. The file hash must equal warm_start_sha256 (locked) or the
-      protocol must be None with an explicit unlocked development run.
 
-    An unlocked uniform/prefix checkpoint never passes as initialization or
-    as a final student merely because its protocol id is None.
-    """
+def verify_student_provenance(payload, protocol, config, path,
+                              role="final"):
+    if role not in ("init", "final"):
+        raise ProtocolError(f"unknown student role {role!r}")
+    design = protocol.get("design", {}) if protocol else {}
     problems = []
+    if protocol is not None:
+        if payload.get("protocol_id") is not None and \
+                payload.get("protocol_id") != protocol.get("protocol_id"):
+            problems.append("checkpoint protocol id differs from the lock")
+        if design.get("arms") and payload.get("arm") not in design["arms"] \
+                and payload.get("arm") != "warm":
+            problems.append(f"checkpoint arm {payload.get('arm')!r} is not locked")
+        if design.get("seeds") and int(payload.get("seed", -1)) not in \
+                [int(s) for s in design["seeds"]]:
+            problems.append("checkpoint seed is not a locked seed")
+        if design.get("bank_sha256", "absent") != "absent" and \
+                payload.get("bank_sha256") not in (None, design["bank_sha256"]):
+            problems.append("checkpoint bank differs from the locked bank")
     if role == "init":
         if protocol is None:
-            problems.append("initialization requires a protocol lock holding "
-                            "the warm-start hash")
-        elif not path or not os.path.exists(path):
-            problems.append("initialization file missing: " + str(path))
-        elif sha256_file(path) != protocol.get("warm_start_sha256"):
-            problems.append("initialization file hash != locked warm_start_sha256; "
-                            "a different unlocked checkpoint cannot initialize "
-                            "locked training")
-        if payload.get("metric_mode") != config.get("metric_mode", "exact"):
-            problems.append("warm-start metric mode differs from the configuration")
-        if problems:
-            raise ProtocolError("checkpoint provenance mismatch for " + str(path) +
-                                ": " + "; ".join(problems))
-        return True
-    if role == "reference":
-        if protocol is not None:
-            if not path or not os.path.exists(path):
-                problems.append("reference file missing: " + str(path))
-            elif sha256_file(path) != protocol.get("warm_start_sha256"):
-                problems.append("reference file hash != locked warm_start_sha256")
-        elif payload.get("protocol_id") is not None:
-            problems.append("reference role with an unlocked protocol requires an "
-                            "unlocked warm-start checkpoint")
-        if payload.get("mode") not in ("uniform", "prefix"):
-            problems.append(f"reference must be a warm-start mode, got "
-                            f"{payload.get('mode')!r}")
-        if problems:
-            raise ProtocolError("reference provenance mismatch for " + str(path) +
-                                ": " + "; ".join(problems))
-        return True
-    if protocol is not None and payload.get("protocol_id") is None:
-        problems.append("unlocked checkpoint cannot serve as a final student; "
-                        "only the hash-matched warm start may initialize training")
-    if protocol is not None:
-        if payload.get("protocol_id") != protocol.get("protocol_id"):
-            problems.append(f"checkpoint protocol id {payload.get('protocol_id')} "
-                            f"!= locked {protocol.get('protocol_id')}")
-        if protocol.get("modes") and payload.get("mode") not in protocol["modes"]:
-            problems.append(f"checkpoint mode {payload.get('mode')} is not a locked mode")
-        if protocol.get("seeds") and payload.get("seed") not in protocol["seeds"]:
-            problems.append(f"checkpoint seed {payload.get('seed')} is not a locked seed")
-        if protocol.get("cache_sha256") != payload.get("cache_sha256"):
-            problems.append("checkpoint was trained from a different cache")
-        if protocol.get("warm_start_sha256") != payload.get("init_sha256"):
-            problems.append("checkpoint used a different warm start")
-        if protocol.get("updates") is not None and \
-                int(payload.get("updates", -1)) != int(protocol["updates"]):
-            problems.append(f"checkpoint ran {payload.get('updates')} updates, "
-                            f"lock says {protocol['updates']}")
-    if payload.get("metric_mode") != config.get("metric_mode", "exact"):
-        problems.append("checkpoint metric mode differs from the configuration")
-    if path and not os.path.exists(path):
-        problems.append("checkpoint file missing")
+            problems.append("init role requires the lock holding warm_sha256")
+        elif sha256_file(path) != design.get("warm_sha256", "absent"):
+            problems.append("init file hash != locked warm_sha256")
+    if role == "final":
+        if payload.get("protocol_id") is None and protocol is not None:
+            problems.append("unlocked checkpoint cannot serve as final student")
+        if protocol is not None and payload.get("init_sha256") != \
+                design.get("warm_sha256", "absent"):
+            problems.append("final student init differs from locked warm start")
     if problems:
-        raise ProtocolError("checkpoint provenance mismatch for " + str(path) +
-                            ": " + "; ".join(problems))
+        raise ProtocolError("checkpoint provenance mismatch for " + str(path)
+                            + ": " + "; ".join(problems))
     return True
 
 
-def _records(frame):
-    if hasattr(frame, "to_dict"):
-        return frame.to_dict("records")
-    return list(frame)
+def compute_env(device="cuda"):
+    """Lightweight resolved-compute record (no torch import required)."""
+    record = dict(device=str(device), schema_version=SCHEMA_VERSION)
+    try:
+        import torch as _torch
+        record["torch_version"] = str(getattr(_torch, "__version__", "unknown"))
+        record["cuda_available"] = bool(_torch.cuda.is_available())
+        if _torch.cuda.is_available():
+            try:
+                record["gpu_name"] = _torch.cuda.get_device_name(device)
+            except Exception:
+                record["gpu_name"] = "unknown"
+        record["deterministic"] = bool(
+            _torch.are_deterministic_algorithms_enabled())
+    except Exception as error:
+        record["torch"] = "missing: " + str(error)
+    return record
 
 
-def check_binary_success(records):
-    bad = sorted({r.get("success") for r in records
-                  if r.get("success") not in (0, 1, True, False)})
-    if bad:
-        raise ValueError(f"success must be binary 0/1, found {bad[:5]}")
+# ---------------------------------------------------------------------------
+# Evaluation gates
+# ---------------------------------------------------------------------------
+
+def check_binary_success(value):
+    outcome = int(value)
+    if outcome not in (0, 1):
+        raise ProtocolError(f"binary success must be 0/1, got {value!r}")
+    return outcome
+
+
+def require_complete(episodes, methods, seeds, scenes):
+    expected = {(m, int(s), int(c)) for m in methods for s in seeds
+                for c in scenes}
+    seen = {}
+    for episode in episodes:
+        key = (episode["method"], int(episode["seed"]), int(episode["scene"]))
+        if key in seen:
+            raise ProtocolError(f"duplicate episode {key}")
+        seen[key] = episode
+    missing = sorted(expected - set(seen))
+    if missing:
+        raise ProtocolError(f"MISSING_EPISODE: {len(missing)} missing, "
+                            f"first: {missing[:5]}")
+    extra = sorted(set(seen) - expected)
+    if extra:
+        raise ProtocolError(f"unexpected episodes: {extra[:5]}")
     return True
 
 
-def require_complete(frame, protocol, method, baseline,
-                     columns=("training_seed", "scene")):
-    records = _records(frame)
-    check_binary_success(records)
-    expected_methods = list(protocol["modes"])
-    expected_seeds = [int(s) for s in protocol["seeds"]]
-    expected_scenes = [int(s) for s in protocol["final_scenes"]]
-    if method not in expected_methods or baseline not in expected_methods:
-        raise ValueError(f"primary contrast {method} vs {baseline} not in the "
-                         f"locked modes {expected_methods}")
-    expected_pairs = {(s, c) for s in expected_seeds for c in expected_scenes}
-    for name in expected_methods:
-        rows = [r for r in records if str(r.get("method")) == name]
-        if not rows:
-            raise ValueError(f"{name}: no evaluation rows at all; every locked "
-                             "method must be present")
-        present_seeds = sorted({int(r[columns[0]]) for r in rows})
-        missing_seeds = sorted(set(expected_seeds) - set(present_seeds))
-        if missing_seeds:
-            raise ValueError(f"{name}: missing training seeds {missing_seeds}")
-        present_scenes = sorted({int(r[columns[1]]) for r in rows})
-        missing_scenes = sorted(set(expected_scenes) - set(present_scenes))
-        extra_scenes = sorted(set(present_scenes) - set(expected_scenes))
-        if missing_scenes:
-            raise ValueError(f"{name}: missing scenes {missing_scenes[:5]} "
-                             f"({len(missing_scenes)} total)")
-        if extra_scenes:
-            raise ValueError(f"{name}: unplanned scenes {extra_scenes[:5]}")
-        observed = {(int(r[columns[0]]), int(r[columns[1]])) for r in rows}
-        missing_pairs = sorted(expected_pairs - observed)
-        if missing_pairs:
-            raise ValueError(f"MISSING_EPISODE: {name}: {len(missing_pairs)} planned evaluation "
-                             f"episodes missing, e.g. {missing_pairs[:5]}")
-        keys = [(str(r.get("method")), int(r[columns[0]]), int(r[columns[1]]))
-                for r in rows if str(r.get("method")) == name]
-        if len(keys) != len(set(keys)):
-            seen, dupes = set(), set()
-            for k in keys:
-                if k in seen:
-                    dupes.add(k)
-                seen.add(k)
-            dupes = sorted(dupes)
-            raise ValueError(f"{name}: duplicate evaluation episodes {dupes[:5]}; "
-                             "never silently deduplicate")
-        if len(observed) != len(expected_pairs):
-            raise ValueError(f"{name}: {len(observed)} rows for "
-                             f"{len(expected_pairs)} planned episodes (duplicates?)")
+def require_eval_metadata(metadata):
+    for key in ("design_id", "protocol", "seeds", "scenes", "methods"):
+        if key not in metadata:
+            raise ProtocolError(f"eval metadata missing {key}")
     return True
-
-
-def require_eval_metadata(frame, protocol, inputs, method=None, baseline=None):
-    """Index metadata by (intrinsic mode, intrinsic seed).
-
-    Two planned fine-tuning seeds legitimately produce two files for one mode;
-    only a duplicated RUN is an error.
-    """
-    records = _records(frame)
-    by_run = {}
-    for path in inputs:
-        sidecar = path.replace(".jsonl", ".meta.json")
-        if not os.path.exists(sidecar):
-            raise ValueError("evaluation metadata missing: " + sidecar)
-        with open(sidecar) as handle:
-            meta = json.load(handle)
-        if meta.get("protocol_id") != protocol.get("protocol_id"):
-            raise ValueError(f"{sidecar}: protocol id {meta.get('protocol_id')} "
-                             f"!= locked {protocol.get('protocol_id')}")
-        key = (str(meta.get("intrinsic_mode")), int(meta.get("intrinsic_seed", -1)))
-        if key in by_run:
-            raise ValueError(f"two evaluation files describe the same run {key}")
-        for field in ("checkpoint_sha256", "protocol_id", "scenes", "split"):
-            if field not in meta:
-                raise ValueError(f"metadata for {key} lacks {field}")
-        rows = [r for r in records
-                if str(r.get("method")) == key[0]
-                and int(r.get("training_seed", -1)) == key[1]]
-        if not rows:
-            raise ValueError(f"{sidecar} describes {key} but no rows carry that "
-                             "mode and seed")
-        row_scenes = sorted({int(r["scene"]) for r in rows})
-        if row_scenes != sorted(int(s) for s in meta["scenes"]):
-            raise ValueError(f"{sidecar}: scene set disagrees with its rows")
-        if meta.get("expected_split") and any(r.get("split") != meta["expected_split"]
-                                              for r in rows):
-            raise ValueError(f"{sidecar}: split label disagrees with its rows")
-        by_run[key] = meta
-    expected_runs = {(str(m), int(s)) for m in protocol["modes"]
-                     for s in protocol["seeds"]}
-    present = set(by_run)
-    missing = sorted(expected_runs - present)
-    unexpected = sorted(k for k in present if k[0] in protocol["modes"]
-                        and k not in expected_runs)
-    if unexpected:
-        raise ValueError(f"metadata for unplanned runs: {unexpected}")
-    if method is not None:
-        key = (method, int(protocol["seeds"][0]))
-        if (method, key[1]) not in by_run and not any(k[0] == method for k in by_run):
-            raise ValueError(f"no evaluation metadata for the primary method {method}")
-    return dict(by_run=by_run, missing_runs=missing)

@@ -1,4 +1,11 @@
+"""Sanity suite: contract/producer checks (numpy) + reference checks (torch-gated).
+
+No simulator, no checkpoint, no GPU required. Torch-dependent checks run
+only when torch imports; --require-torch turns a skip into a failure.
+Every reported boolean is asserted True by the final sweep.
+"""
 import argparse
+import copy
 import json
 import os
 import sys
@@ -8,684 +15,247 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-PARENT = os.path.dirname(HERE)
-if os.path.isdir(os.path.join(PARENT, "experiment")):
-    sys.path.insert(0, PARENT)
+sys.path.insert(0, os.path.dirname(HERE))
 import contract as C
 
 
 def load_config():
-    for candidate in (os.path.join(PARENT, "experiment", "config.json"),
-                      os.path.join(HERE, "config.json")):
+    for candidate in (os.path.join(HERE, "config.json"),
+                      "experiment/config.json"):
         if os.path.exists(candidate):
             with open(candidate) as handle:
-                return json.load(handle), candidate
+                config = json.load(handle)
+            C.validate_config(config, candidate)
+            return config, candidate
     raise FileNotFoundError("config.json not found")
 
 
-def check_linear_algebra():
-    """NumPy-only algebra: finite differences against a known linear map, and the
-    pullback quadratic/trace identities re-derived independently."""
-    matrix = np.array([[2.0, 0.0, 0.5], [0.0, 0.5, -1.0]])
-    offset = np.array([1.0, -2.0])
-
-    def execute(action):
-        return matrix @ np.asarray(action) + offset
-
-    action = np.array([0.3, -0.2, 0.1])
-    epsilon = 1e-6
-    columns = []
-    for coordinate in range(action.size):
-        step = np.zeros_like(action)
-        step[coordinate] = epsilon
-        columns.append((execute(action + step) - execute(action - step)) / (2 * epsilon))
-    estimated = np.stack(columns, axis=-1)
-    gap = float(np.abs(estimated - matrix).max())
-    assert gap < 1e-6, f"finite difference gap {gap}"
-    C_matrix = np.array([[1.0, 2.0], [0.0, 1.0], [-1.0, 0.5]])
-    target = np.array([0.1, -0.2])
-    value = float(np.sum((C_matrix @ target) ** 2))
-    trace = float(np.sum(C_matrix ** 2))
-    assert abs(value - float(np.dot(C_matrix @ target, C_matrix @ target))) < 1e-12
-    assert abs(trace - float(np.trace(C_matrix.T @ C_matrix))) < 1e-12
-    assert abs(trace - 7.25) < 1e-12, trace
-    return dict(finite_difference_gap=gap, quadratic=value, trace=trace)
-
-
 def check_config_validation():
-    config, path = load_config()
-    C.validate_config(config, path)
-    rejected = []
-    cases = [("teacher_steps", 0), ("teacher_steps", 15), ("execute_steps", 0),
-             ("execute_steps", 17), ("episode_steps", -1), ("num_probes", 0),
-             ("batch_size", 127), ("finite_difference_epsilon", 0.0),
-             ("learning_rate", 0.0), ("metric_weight", -1),
-             ("validation_metric_contexts", 0), ("native_fast_steps", 0),
-             ("source", "gauss"), ("metric_mode", "approx")]
-    for key, value in cases:
-        broken = dict(config)
-        broken[key] = value
+    bad = []
+    config, _ = load_config()
+    for key, value in (("teacher_steps", 0), ("batch_size", 0),
+                       ("rho", 0.0), ("learning_rate", 0.0)):
+        edited = dict(config, **{key: value})
         try:
-            C.validate_config(broken, "test")
-        except ValueError as error:
-            rejected.append(f"{key}={value}: {str(error)[:48]}")
-        else:
-            raise AssertionError(f"validate_config accepted {key}={value}")
-    for key in ("validation_scene_start", "test_scene_start"):
-        overlap = dict(config)
-        overlap[key] = config["train_scene_start"]
-        try:
-            C.validate_config(overlap, "test")
+            C.validate_config(edited, "test")
         except ValueError:
-            rejected.append(f"{key} overlap rejected")
+            bad.append(f"{key}={value}")
         else:
-            raise AssertionError(f"{key} overlap accepted")
-    return rejected
-
-
-def synthetic_context(scene, split, rng, with_metric=False, metric_mode="exact"):
-    context = {"scene": scene, "split": split, "decision": 0, "step": 0,
-               "condition": rng.standard_normal(514).astype(np.float32),
-               "noise": rng.standard_normal((16, 2)).astype(np.float32),
-               "midpoint": rng.standard_normal((16, 2)).astype(np.float32),
-               "target_mid": rng.standard_normal((16, 2)).astype(np.float32),
-               "target_end": rng.standard_normal((16, 2)).astype(np.float32),
-               "teacher_end": rng.standard_normal((16, 2)).astype(np.float32),
-               "history": [], "signature_initial": [0.0],
-               "signature_live": [0.0]}
-    if with_metric:
-        context["has_metric"] = True
-        context["jacobian_start"] = rng.standard_normal((32, 16)).astype(np.float32)
-        context["jacobian_end"] = rng.standard_normal((32, 16)).astype(np.float32)
-        if metric_mode == "exact":
-            context["metric_exact"] = rng.standard_normal((32, 32)).astype(np.float32)
-        else:
-            context["probes"] = rng.standard_normal((4, 32)).astype(np.float32)
-    return context
-
-
-def check_producer_consumer(config, tmpdir):
-    """The exact schema regression the audit found: caches written by the
-    producer helpers must validate in every consumer."""
-    rng = np.random.default_rng(0)
-    train_scenes = sorted(C.scene_range(config, "train"))[:4]
-    validation_scenes = sorted(C.scene_range(config, "validation"))[:2]
-    contexts = ([synthetic_context(s, "train", rng) for s in train_scenes]
-                + [synthetic_context(s, "validation", rng) for s in validation_scenes])
-    label_path = os.path.join(tmpdir, "labels.npz")
-    meta = dict(schema_version=C.SCHEMA_VERSION, mode="shared", source=config["source"],
-                seed=0, student="warm.pt", splits={"train": 4, "validation": 2},
-                contexts=len(contexts))
-    C.write_label_cache(label_path, contexts, config, meta,
-                            dict(source_hashes=C.source_hashes(), mode="shared"))
-    verified = C.verify_label_cache(label_path, config, expect_mode="shared",
-                                    allowed_scenes=C.scene_range(config, "train") |
-                                    C.scene_range(config, "validation"))
-    out = {"label_cache_contexts": verified["n_contexts"],
-           "splits": verified["splits"]}
+            raise AssertionError(f"invalid {key} accepted")
+    edited = dict(config, arms=["gad", "unknown"])
     try:
-        C.verify_label_cache(label_path, config, require_metric=True)
+        C.validate_config(edited, "test")
     except ValueError:
-        out["metric_required_rejected"] = True
+        bad.append("arms=unknown")
     else:
-        raise AssertionError("label-only cache accepted where metrics are required")
-    train_rows, validation_rows = C.metric_subset(verified, config)
-    out["subset"] = dict(train=len(train_rows), validation=len(validation_rows))
-    assert all(row["split"] == "train" for row in train_rows)
-    assert all(row["split"] == "validation" for row in validation_rows)
-    seen_wrong_split = [c for c in contexts if c["split"] != C.split_of_scene(config, c["scene"])]
-    assert not seen_wrong_split, "split label disagrees with the configured range"
-
-    label_keys = sorted(set(verified["contexts"][0]) - {"scene", "split", "decision",
-                                                      "step", "history",
-                                                      "signature_initial",
-                                                      "signature_live"})
-    assert "metric_exact" not in label_keys and "jacobian_start" not in label_keys
-    out["label_context_keys"] = label_keys
-
-    metric_contexts = [synthetic_context(s, "train", rng, with_metric=True)
-                       for s in train_scenes]
-    metric_path = os.path.join(tmpdir, "metrics.npz")
-    metric_meta = dict(schema_version=C.SCHEMA_VERSION,
-                       metric_mode=config["metric_mode"], num_probes=config["num_probes"],
-                       epsilon=config["finite_difference_epsilon"],
-                       counts={"train": len(metric_contexts), "validation": 0,
-                               "total": len(metric_contexts)},
-                       source=config["source"], splits={"train": len(metric_contexts)})
-    C.write_metric_cache(metric_path, metric_contexts, config, metric_meta,
-                             dict(cache=label_path,
-                                  source_hashes=C.source_hashes(),
-                                  epsilon=config["finite_difference_epsilon"]))
-    metric_verified = C.verify_label_cache(metric_path, config, require_metric=True)
-    out["metric_cache_contexts"] = metric_verified["n_contexts"]
-    drifted = dict(config)
-    drifted["execute_steps"] = 4
+        raise AssertionError("unknown arm accepted")
+    edited = dict(config, train_scene_start=config["validation_scene_start"])
     try:
-        C.verify_label_cache(metric_path, drifted, require_metric=True)
+        C.validate_config(edited, "test")
     except ValueError:
-        out["contract_drift_rejected"] = True
+        bad.append("overlap")
     else:
-        raise AssertionError("cache accepted a changed execution contract")
-    changed_metric = dict(config)
-    changed_metric["metric_mode"] = "sketch" if config["metric_mode"] == "exact" else "exact"
-    try:
-        C.verify_label_cache(metric_path, changed_metric, require_metric=True)
-    except ValueError:
-        out["metric_mode_change_rejected"] = True
-    else:
-        raise AssertionError("cache accepted a changed metric mode")
-    return out
+        raise AssertionError("overlapping scenes accepted")
+    return dict(rejected=bad)
 
 
-def check_metric_subset_spread(config):
-    """The exact-metric subset must spread across scenes, not take the earliest."""
-    rng = __import__("numpy").random.default_rng(0)
-    contexts = []
-    for scene_offset in range(8):
-        scene = sorted(C.scene_range(config, "train"))[scene_offset]
-        for _ in range(10):
-            contexts.append(synthetic_context(scene, "train", rng))
-    verified = {"contexts": contexts}
-    train_rows, _ = C.metric_subset(verified, dict(config, metric_contexts=16,
-                                                   validation_metric_contexts=0))
-    scenes = sorted({int(r["scene"]) for r in train_rows})
-    assert len(train_rows) == 16, len(train_rows)
-    assert len(scenes) >= 6, f"subset concentrates in {scenes}"
-    earliest = sorted(C.scene_range(config, "train"))[0]
-    assert sum(1 for r in train_rows if int(r["scene"]) == earliest) <= 4,         "subset overweights the earliest scene"
-    return dict(scenes=scenes, n=len(train_rows))
+def check_stable_seed():
+    import gad_reference as R
+    a = R.stable_seed("pairs", 20000, 0, 0, 0)
+    assert a == R.stable_seed("pairs", 20000, 0, 0, 0)
+    assert a != R.stable_seed("pairs", 20000, 0, 0, 1)
+    assert 0 <= a < 2 ** 63
+    assert C.stable_seed("pairs", 20000, 0, 0, 0) == a
+    return dict(deterministic=True)
 
 
-def check_empty_metric_count():
-    """metric_count=0 must yield a ZERO physical penalty, never NaN and never
-    a full-batch fallback that charges ordinary rows."""
-    import torch
-    from core import TwoStepStudent, objective
-    torch.manual_seed(0)
-    student = TwoStepStudent(condition_dim=8, horizon=16, action_dim=2, width=32)
-    batch = {k: torch.zeros(4, 16, 2) for k in
-             ("noise", "midpoint", "target_mid", "target_end", "teacher_end")}
-    batch["condition"] = torch.zeros(4, 8)
-    for count in (0, None):
-        loss, parts = objective(student, batch, "uniform", 8, None,
-                                metric_count=count)
-        assert torch.isfinite(loss), f"uniform with metric_count={count} is nonfinite"
-        assert float(parts["penalty"]) == 0.0, \
-            f"uniform with empty selection must carry zero physical penalty, got {parts['penalty']}"
-    loss, parts = objective(student, batch, "prefix", 8, None,
-                            metric_count=0)
-    assert torch.isfinite(loss), "label-only prefix is nonfinite"
-    hot_batch = {k: (v if k == "condition" else torch.randn_like(v) * 2.0)
-                 for k, v in batch.items()}
-    _, hot_parts = objective(student, hot_batch, "prefix", 8, None,
-                             metric_count=0)
-    assert float(hot_parts["penalty"]) > 0.0, \
-        "label-only prefix must weight early steps over the whole batch, not zero it"
-    return dict(empty_count_yields_zero_physical_penalty=True,
-                label_only_prefix_covers_whole_batch=True)
-
-
-def check_warm_provenance_roles(config, tmpdir):
-    """Item 2: a different unlocked uniform checkpoint must fail as BOTH
-    initialization and final student; only the hash-matched warm start
-    initializes locked training."""
-    import torch
-    warm_path = os.path.join(tmpdir, "warm.pt")
-    other_path = os.path.join(tmpdir, "other.pt")
-    torch.save({"x": torch.zeros(1)}, warm_path)
-    torch.save({"x": torch.ones(1)}, other_path)
-    warm_hash = C.sha256_file(warm_path)
-    protocol = dict(protocol_id="pid", modes=["uniform", "pullback"],
-                    seeds=[0, 1], updates=6000, cache_sha256="c",
-                    warm_start_sha256=warm_hash)
-    warm_payload = dict(protocol_id=None, mode="uniform", seed=0, updates=6000,
-                        metric_mode=config.get("metric_mode", "exact"))
-    assert C.verify_student_provenance(warm_payload, protocol, config,
-                                       warm_path, role="init") is True
-    assert C.verify_student_provenance(warm_payload, None, config,
-                                       warm_path, role="reference") is True
-    for role in ("init", "final"):
-        try:
-            C.verify_student_provenance(warm_payload, protocol, config,
-                                        other_path, role=role)
-        except C.ProtocolError:
-            pass
-        else:
-            raise AssertionError(f"different unlocked checkpoint passed as {role}")
-    return dict(hash_matched_init_accepted=True,
-                different_checkpoint_rejected_as_init_and_final=True)
-
-
-def check_canonical_binding(config):
-    """Item 6: editing final scenes, contrast, updates, or modes without
-    regenerating the lock must fail verification."""
-    import copy
-    base_choices = C.canonical_choices(config, ["uniform", "pullback"], [0, 1],
-                                       5, None, None, None,
-                                       final_scenes=[10, 11],
-                                       primary_contrast=["pullback", "uniform"])
-    edited = copy.deepcopy(base_choices)
-    edited["final_scenes"] = [10, 12]
-    assert C.combined_id(dict(choices=base_choices)) != \
-        C.combined_id(dict(choices=edited)), "scene edit invisible to the id"
-    edited_contrast = copy.deepcopy(base_choices)
-    edited_contrast["primary_contrast"] = ["pullback", "endpoint"]
-    assert C.combined_id(dict(choices=base_choices)) != \
-        C.combined_id(dict(choices=edited_contrast)), "contrast edit invisible"
-    return dict(canonical_binds_scenes_and_contrast=True)
-
-
-def check_duplicate_episodes_rejected():
-    """Item 9: five rows for four planned episodes must fail completeness."""
-    protocol = dict(modes=["pullback", "endpoint"], seeds=[0],
-                    final_scenes=[10, 11])
-    rows = []
-    for method in ("pullback", "endpoint"):
-        for scene in (10, 11):
-            rows.append({"method": method, "training_seed": 0, "scene": scene,
-                         "success": 1})
-    rows.append({"method": "pullback", "training_seed": 0, "scene": 10,
-                 "success": 1})
-    try:
-        C.require_complete(rows, protocol, "pullback", "endpoint")
-    except ValueError as error:
-        assert "duplicate" in str(error).lower(), str(error)
-    else:
-        raise AssertionError("duplicated episodes passed completeness")
-    return dict(duplicates_rejected=True)
-
-
-def check_development_eval_gate():
-    """Item 1: unlocked development evaluation is accepted; unlocked test
-    evaluation is rejected."""
-    import types
-    import pilot
-    dev = types.SimpleNamespace(protocol=None, command="evaluate",
-                                development=True, allow_unlocked=True,
-                                config="experiment/config.json")
-    assert pilot.protocol_for(dev, {}) == (None, None)
-    test = types.SimpleNamespace(protocol=None, command="evaluate",
-                                 development=False, allow_unlocked=True,
-                                 config="experiment/config.json")
-    try:
-        pilot.protocol_for(test, {})
-    except C.ProtocolError:
-        pass
-    else:
-        raise AssertionError("unlocked test evaluation accepted")
-    return dict(dev_accepted_test_rejected=True)
-
-
-def check_device_key_normalization():
-    import torch
-    from hri_adapter import _device_key
-    assert _device_key("cuda") == _device_key("cuda:0"), "cuda != cuda:0"
-    assert _device_key("cuda:0") != _device_key("cuda:1"), "cuda:0 == cuda:1"
-    assert _device_key("cpu") == _device_key("cpu")
-    return dict(cuda_equals_cuda0=True)
-
-
-def check_spearman():
-    from scipy.stats import spearmanr
-    a = np.array([1.0, 2.0, 2.0, 3.0, 3.0])
-    b = np.array([5.0, 4.0, 4.0, 6.0, 6.0])
-    double_argsort = np.corrcoef(np.argsort(np.argsort(a)), np.argsort(np.argsort(b)))[0, 1]
-    tie_aware = float(spearmanr(a, b).statistic)
-    assert abs(tie_aware - double_argsort) > 1e-6, \
-        "this fixture must expose the tie handling difference"
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        constant = float(spearmanr(np.ones(4), np.arange(4)).statistic)
-    assert np.isnan(constant), "constant input must report an undefined rank"
-    return dict(tie_aware=tie_aware, double_argsort=float(double_argsort),
-                constant_reported_as_nan=bool(np.isnan(constant)))
-
-
-def check_reserve_and_completion(tmpdir):
+def check_reserve_complete(tmpdir):
     path = os.path.join(tmpdir, "artifact.npz")
     C.reserve_outputs([path])
-    assert os.path.exists(path + ".reserved")
     try:
         C.reserve_outputs([path])
-    except ValueError:
+    except C.ProtocolError:
         pass
     else:
-        raise AssertionError("reservation did not block a second claim")
-    C.atomic_savez(path, a=np.zeros(3))
+        raise AssertionError("double reservation accepted")
+    import numpy as _np
+    _np.savez(path, a=_np.zeros(3))
     C.complete_output(path, dict(note="synthetic"))
-    assert C.is_complete(path), "completion record missing"
-    assert not os.path.exists(path + ".reserved")
-    C.mark_incomplete(path, "synthetic failure")
-    assert not C.is_complete(path), "incomplete artifact still reports complete"
-    return dict(reserved=True, completed=True, incomplete_after_failure=True)
-
-
-def check_protocol_and_analysis(config, config_path, tmpdir):
-    protocols = {}
-    upstream = C.upstream_hashes(config["repository"])
-    smoke = os.path.join(tmpdir, "smoke.json")
-    cache = os.path.join(tmpdir, "cache.npz")
-    warm = os.path.join(tmpdir, "warm.pt")
-    with open(smoke, "w") as handle:
-        json.dump({"passed": True}, handle)
-    np.savez(cache, contexts=np.zeros(1))
-    with open(warm, "wb") as handle:
-        handle.write(b"warm")
-    protocol = dict(modes=["pullback", "endpoint"], seeds=[0, 1],
-                    final_scenes=[10, 11], protocol_id="pid",
-                    primary_contrast=["pullback", "endpoint"],
-                    source_hashes=C.source_hashes(), upstream=upstream,
-                    upstream_commit=C.upstream_commit(config["repository"]),
-                    packages=C.package_versions(["numpy"]),
-                    resolved_config=config, assets=C.asset_hashes(config),
-                    checkpoint_sha256=None, normalizer_sha256=None,
-                    smoke_report=smoke, smoke_report_sha256=C.sha256_file(smoke),
-                    cache=cache, cache_sha256=C.sha256_file(cache),
-                    warm_start=warm, warm_start_sha256=C.sha256_file(warm))
-    protocol["canonical_choices"] = C.canonical_choices(
-        config, ["pullback", "endpoint"], [0, 1], None, warm, cache, smoke,
-        final_scenes=[10, 11], primary_contrast=["pullback", "endpoint"])
-    protocol["protocol_id"] = C.combined_id(dict(
-        config=C.source_hashes(), config_file=C.sha256_file(config_path),
-        cache=protocol["cache_sha256"], warm=protocol["warm_start_sha256"],
-        smoke_report=protocol["smoke_report_sha256"], assets=protocol["assets"],
-        upstream=protocol["upstream"], upstream_commit=protocol["upstream_commit"],
-        choices=protocol["canonical_choices"], resolved=config))
-    C.verify_current_protocol(protocol, config, config_path)
-    protocols["fresh_lock_verified"] = True
-    missing = dict(protocol)
-    os.remove(cache)
+    assert C.verify_completed(path) is not None
+    with open(path, "ab") as handle:
+        handle.write(b"x")
     try:
-        C.verify_current_protocol(missing, config, config_path)
-    except C.ProtocolError:
-        protocols["missing_artifact_rejected"] = True
+        C.verify_completed(path)
+    except C.ProtocolError as error:
+        assert "ARTIFACT_HASH_MISMATCH" in str(error), str(error)
     else:
-        raise AssertionError("missing locked artifact accepted")
-    np.savez(cache, contexts=np.zeros(1))
-    stale = dict(protocol)
-    stale["source_hashes"] = {"experiment/core.py": "deadbeef"}
-    try:
-        C.verify_current_protocol(stale, config, config_path)
-    except C.ProtocolError:
-        protocols["stale_source_rejected"] = True
-    else:
-        raise AssertionError("stale source hashes accepted")
-    stale = dict(protocol)
-    stale["resolved_config"] = dict(config, execute_steps=4)
-    try:
-        C.verify_current_protocol(stale, config, config_path)
-    except C.ProtocolError:
-        protocols["config_drift_rejected"] = True
-    else:
-        raise AssertionError("configuration drift accepted")
-
-    good = [dict(method=m, training_seed=s, scene=c, success=1,
-                 protocol_id=protocol["protocol_id"], split="test",
-                 decision_latency_median_ms=1.0,
-                 score=0.9, raw_violation_fraction=0.0)
-            for m in ("pullback", "endpoint") for s in (0, 1) for c in (10, 11)]
-    C.require_complete(good, protocol, "pullback", "endpoint")
-    protocols["complete_ok"] = True
-    partial = [r for r in good if not (r["training_seed"] == 1 and r["scene"] == 10)]
-    try:
-        C.require_complete(partial, protocol, "pullback", "endpoint")
-    except ValueError as error:
-        assert "MISSING_EPISODE" in str(error), str(error)
-        protocols["joint_missing_pair_rejected"] = True
-    else:
-        raise AssertionError("joint missing pair accepted")
-    non_binary = [dict(r, success=2) for r in good]
-    try:
-        C.require_complete(non_binary, protocol, "pullback", "endpoint")
-    except ValueError:
-        protocols["non_binary_success_rejected"] = True
-    else:
-        raise AssertionError("non-binary success accepted")
-
-    for mode in ("pullback", "endpoint"):
-        for seed in (0, 1):
-            jsonl = os.path.join(tmpdir, f"final_{mode}_seed{seed}.jsonl")
-            with open(jsonl, "w") as handle:
-                for row in [r for r in good if r["method"] == mode
-                            and r["training_seed"] == seed]:
-                    handle.write(json.dumps(row) + "\n")
-            C.write_meta(jsonl.replace(".jsonl", ".meta.json"),
-                         dict(kind="evaluation", intrinsic_mode=mode,
-                              intrinsic_seed=seed, checkpoint_sha256="sha",
-                              protocol_id=protocol["protocol_id"],
-                              split="test", expected_split="test",
-                              scenes=[10, 11]))
-    inputs = [os.path.join(tmpdir, f"final_{m}_seed{s}.jsonl")
-              for m in ("pullback", "endpoint") for s in (0, 1)]
-    meta = C.require_eval_metadata(good, protocol, inputs, method="pullback")
-    protocols["two_seeds_accepted"] = sorted(meta["by_run"])
-    try:
-        C.require_eval_metadata(good, protocol, inputs + [inputs[0]],
-                                method="pullback")
-    except ValueError:
-        protocols["duplicate_run_rejected"] = True
-    return protocols
+        raise AssertionError("corrupted bytes accepted")
+    return dict(reserved=True, hash_mismatch_detected=True)
 
 
-def check_mixed_cache_diagnostic(config):
-    import sys as _sys
-    _sys.path.insert(0, HERE)
-    import diagnose as D
-    rng = np.random.default_rng(3)
-    small = dict(config, validation_metric_contexts=8)
-    train_scenes = sorted(C.scene_range(config, "train"))[:2]
-    val_scenes = sorted(C.scene_range(config, "validation"))[:4]
+def check_history_pair_roundtrip(config, tmpdir):
+    rng = np.random.default_rng(0)
     contexts = []
-    for scene in val_scenes:
-        for k in range(4):
-            contexts.append(synthetic_context(scene, "validation", rng,
-                                              with_metric=(k < 2)))
-    for scene in train_scenes:
-        contexts.append(synthetic_context(scene, "train", rng))
-    rows = D.validation_rows(contexts, small, per_scene=2, max_contexts=16)
-    assert rows, "mixed cache yielded no diagnostic rows"
-    for i in rows:
-        assert contexts[i].get("has_metric"), f"diagnostic row {i} lacks metric tensors"
-        assert contexts[i]["split"] == "validation"
-    scenes = {int(contexts[i]["scene"]) for i in rows}
-    assert len(scenes) >= 2, f"rows concentrate in {scenes}"
-    return dict(rows=len(rows), scenes=sorted(scenes), all_metric_labelled=True)
+    for i in range(4):
+        contexts.append(dict(
+            history_id=f"train-20000-{i}", scene=20000, split="train",
+            decision=i, history=[[0.0, 0.0]],
+            sig_initial=[0.0] * 10, sig_live=[0.0] * 10,
+            condition=rng.standard_normal(514).astype(np.float64).tolist(),
+            endpoint=rng.standard_normal((16, 2)).astype(np.float64).tolist(),
+            collector_hash="test"))
+    path = os.path.join(tmpdir, "hist.json")
+    C.write_history_cache(path, contexts, config)
+    verified = C.verify_history_cache(path, config)
+    assert len(verified["histories"]) == 4
+    assert isinstance(verified["histories"][0]["condition"], np.ndarray)
+    records = [dict(pair_id=[f"train-20000-{i}", 0, 0], history_id=f"train-20000-{i}",
+                    anchor_id=0, direction_id=0,
+                    q=rng.standard_normal((16, 2)).tolist(),
+                    u=(np.ones((16, 2)) / np.sqrt(32)).tolist(),
+                    rho=float(config["rho"]), source="gaussian",
+                    t0=rng.standard_normal((16, 2)).tolist(),
+                    t1=rng.standard_normal((16, 2)).tolist(),
+                    condition=rng.standard_normal(514).tolist(),
+                    teacher_steps=int(config["teacher_steps"]))
+               for i in range(4)]
+    meta = dict(member_keys=[[f"train-20000-{i}", 0, 0] for i in range(4)],
+                rho=float(config["rho"]), source="gaussian",
+                teacher_steps=int(config["teacher_steps"]))
+    bank = os.path.join(tmpdir, "bank.json")
+    C.write_pair_bank(bank, records, meta, config, lineage={"test": True})
+    verified_bank = C.verify_pair_bank(bank, config)
+    assert isinstance(verified_bank["records"][0]["q"], np.ndarray)
+    edited = dict(config, rho=float(config["rho"]) * 2)
+    try:
+        C.verify_pair_bank(bank, edited)
+    except C.ProtocolError:
+        pass
+    else:
+        raise AssertionError("rho drift accepted")
+    return dict(history_records=4, pair_records=4, drift_rejected=True)
 
 
-def check_mutated_lock_rejected(config, config_path):
-    import copy
-    import tempfile as _tf
-    with _tf.TemporaryDirectory() as tmpdir:
-        smoke = os.path.join(tmpdir, "smoke.json")
-        cache = os.path.join(tmpdir, "cache.npz")
-        warm = os.path.join(tmpdir, "warm.pt")
-        with open(smoke, "w") as handle:
-            handle.write("{}")
-        np.savez(cache, contexts=np.zeros(1))
-        with open(warm, "wb") as handle:
-            handle.write(b"warm")
-        choices = C.canonical_choices(config, ["uniform"], [0], 1, warm, cache,
-                                      smoke, final_scenes=[10],
-                                      primary_contrast=["uniform", "pullback"])
-        protocol = dict(protocol_id="x", modes=["uniform"], seeds=[0],
-                        updates=1, final_scenes=[10],
-                        primary_contrast=["uniform", "pullback"],
-                        canonical_choices=choices,
-                        source_hashes=C.source_hashes(),
-                        resolved_config=config)
-        mutated = copy.deepcopy(protocol)
-        mutated["final_scenes"] = [11]
-        try:
-            C.verify_current_protocol(mutated, config, config_path)
-        except C.ProtocolError as error:
-            assert "final_scenes" in str(error) or "identifier" in str(error), str(error)
-        else:
-            raise AssertionError("mutated lock passed the real verifier")
-        mutated2 = copy.deepcopy(protocol)
-        mutated2["canonical_choices"] = dict(choices, updates=999)
-        try:
-            C.verify_current_protocol(mutated2, config, config_path)
-        except C.ProtocolError as error:
-            assert "identifier" in str(error) or "canonical" in str(error), str(error)
-        else:
-            raise AssertionError("mutated canonical payload passed the real verifier")
-    return dict(scene_edit_rejected=True, canonical_edit_rejected=True)
+def check_canonical_design(config):
+    scenes = {"train": [20000], "final": [60000]}
+    design = C.canonical_design(config, ["anchor"], [0], 10, ["anchor"],
+                                scenes, dict(config["correction"]), 0.1,
+                                float(config["rho"]), {"device": "cpu"},
+                                {"teacher": {"method": "teacher"}},
+                                warm=None, bank=None, cache=None)
+    assert C.design_id(design) == design["design_id"]
+    mutated = copy.deepcopy(design)
+    mutated["scenes"] = {"train": [20001], "final": [60000]}
+    assert C.design_id(mutated) != design["design_id"]
+    return dict(recomputes=True, mutation_detected=True)
 
 
-def check_manifest():
-    manifest_path = os.path.join(HERE, "MANIFEST.json")
-    with open(manifest_path) as handle:
-        on_disk = json.load(handle)
-    assert on_disk["files"] == C.source_hashes(), \
-        "MANIFEST.json is stale: regenerate it, never tested stale"
-    verified = C.verify_manifest(manifest_path)
-    assert verified["verified"] == len(on_disk["files"]), verified
-    manifest = C.check_manifest()
-    assert not manifest["missing"], f"missing sources: {manifest['missing']}"
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fixture = os.path.join(tmpdir, "MANIFEST.json")
-        with open(fixture, "w") as handle:
-            json.dump(on_disk, handle)
-        re_verified = C.verify_manifest(
-            fixture, experiment_dir_override=HERE)
-        assert re_verified["verified"] == verified["verified"]
-    return dict(files=verified["verified"],
-                delivery_risk=manifest["delivery_risk"][:4])
+def check_require_complete():
+    episodes = [dict(method="gad", seed=0, scene=60000, success=1),
+                dict(method="gad", seed=0, scene=60001, success=0),
+                dict(method="augmented", seed=0, scene=60000, success=1),
+                dict(method="augmented", seed=0, scene=60001, success=1)]
+    assert C.require_complete(episodes, ["gad", "augmented"], [0],
+                              [60000, 60001]) is True
+    try:
+        C.require_complete(episodes[:3], ["gad", "augmented"], [0],
+                           [60000, 60001])
+    except C.ProtocolError as error:
+        assert "MISSING_EPISODE" in str(error), str(error)
+    else:
+        raise AssertionError("missing episode accepted")
+    try:
+        C.require_complete(episodes + [episodes[0]], ["gad", "augmented"],
+                           [0], [60000, 60001])
+    except C.ProtocolError:
+        pass
+    else:
+        raise AssertionError("duplicate episode accepted")
+    try:
+        C.check_binary_success(2)
+    except C.ProtocolError:
+        pass
+    else:
+        raise AssertionError("nonbinary success accepted")
+    return dict(complete_ok=True, missing_rejected=True,
+                duplicate_rejected=True, nonbinary_rejected=True)
+
+
+def check_torch():
+    import torch
+    sys.path.insert(0, os.path.dirname(HERE))
+    import gad_reference as R
+    torch.manual_seed(0)
+    latent = torch.randn(2, 16, 2, dtype=torch.float32)
+    condition = torch.randn(2, 514, dtype=torch.float32)
+    direction = torch.randn_like(latent)
+    direction = direction / direction.flatten(1).norm(p=2, dim=1).reshape(-1, 1, 1)
+    t0, t1 = 2 * latent, 2 * (latent + 0.1 * direction)
+
+    class ScaleMap(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.s = torch.nn.Parameter(torch.tensor(0.7))
+        def forward(self, x, c):
+            return self.s * x
+
+    out = {}
+    grads = {}
+    for mode, beta in (("anchor", 0.1), ("augmented", 0.1), ("gad", 0.0),
+                       ("gad", 0.1)):
+        model = ScaleMap()
+        terms = R.paired_loss(model, latent, condition, direction, t0, t1,
+                              0.1, mode, beta)
+        terms["loss"].backward()
+        grads[(mode, beta)] = model.s.grad.clone()
+        out[(mode, beta)] = float(terms["loss"])
+    assert out[("augmented", 0.1)] == out[("gad", 0.0)]
+    assert torch.equal(grads[("augmented", 0.1)], grads[("gad", 0.0)])
+    assert not torch.equal(grads[("augmented", 0.1)], grads[("gad", 0.1)])
+    student = R.make_student()
+    with torch.no_grad():
+        assert torch.allclose(student(latent, condition), latent)
+    frozen = R.make_student().eval().requires_grad_(False)
+    init = torch.zeros(1, 16, 2)
+    cond = torch.zeros(1, 514)
+    tgt = torch.full((1, 8, 2), 0.5)
+    zero = R.invert_prefix(frozen, init, cond, tgt, steps=0)
+    assert torch.equal(zero["latent"], init)
+    assert zero["forward_calls"] == 1 and zero["backward_calls"] == 0
+    return dict(loss_equivalence=True, nonzero_response_gradient=True,
+                identity_init=True, inversion_identity=True)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--require-torch", action="store_true")
     args = parser.parse_args()
-    config, config_path = load_config()
-    results = {"metric_subset_spread": check_metric_subset_spread(config),
-               "canonical_binding": check_canonical_binding(config),
-               "duplicate_episodes": check_duplicate_episodes_rejected(),
-               "mixed_cache_diagnostic": check_mixed_cache_diagnostic(config),
-               "mutated_lock_rejected": check_mutated_lock_rejected(config, config_path),
-               "linear_algebra": check_linear_algebra(),
-               "config_validation": check_config_validation(),
-               "spearman_ties": check_spearman(),
-               "manifest": check_manifest()}
+    config, _ = load_config()
+    results = {"config_validation": check_config_validation(),
+               "stable_seed": check_stable_seed(),
+               "canonical_design": check_canonical_design(config),
+               "require_complete": check_require_complete()}
     with tempfile.TemporaryDirectory() as tmpdir:
-        results["producer_consumer"] = check_producer_consumer(config, tmpdir)
-        results["reserve_and_completion"] = check_reserve_and_completion(tmpdir)
-        results["warm_provenance_roles"] = check_warm_provenance_roles(config,
-                                                                       tmpdir)
-        results["protocol_and_analysis"] = check_protocol_and_analysis(
-            config, config_path, tmpdir)
+        results["reserve_complete"] = check_reserve_complete(tmpdir)
+        results["history_pair_roundtrip"] = check_history_pair_roundtrip(
+            config, tmpdir)
     try:
-        import torch
-        results["development_eval_gate"] = check_development_eval_gate()
-        results["empty_metric_count"] = check_empty_metric_count()
-        results["device_keys"] = check_device_key_normalization()
-        from core import (TwoStepStudent, objective, pullback_metric_exact,
-                          pullback_probes, pullback_quadratic, pullback_trace)
-        torch.manual_seed(0)
-        results["torch_checks"] = check_torch(torch, TwoStepStudent, objective,
-                                              pullback_metric_exact, pullback_probes,
-                                              pullback_quadratic, pullback_trace)
+        import torch  # noqa: F401
+        results["torch_checks"] = check_torch()
     except ImportError:
         if args.require_torch:
             raise
         results["torch_checks"] = "skipped (torch unavailable)"
-    def _sweep(node, trail=""):
+
+    def sweep(node, trail=""):
         if isinstance(node, dict):
             for key, value in node.items():
-                _sweep(value, trail + "/" + str(key))
+                sweep(value, trail + "/" + str(key))
         elif node is False:
-            raise AssertionError(f"sanity check reported False at {trail}")
-    _sweep(results)
+            raise AssertionError(f"sanity check False at {trail}")
+    sweep(results)
     print("sanity " + json.dumps(results, default=str))
     return 0
-
-
-def check_torch(torch, TwoStepStudent, objective, pullback_metric_exact,
-                pullback_probes, pullback_quadratic, pullback_trace):
-    out = {}
-    # A KNOWN linear suffix: suffix(y) = M y with M a fixed 32x32 matrix, so
-    # J_prefix must equal the first 16 rows of M and C = B0 @ M[:16].
-    generator = torch.Generator().manual_seed(0)
-    matrix = torch.randn(32, 32, generator=generator)
-
-    def suffix(variable):
-        flat = variable.reshape(variable.shape[0], -1)
-        return (flat @ matrix.transpose(0, 1)).reshape(variable.shape)
-
-    target = torch.randn(1, 16, 2, generator=torch.Generator().manual_seed(1))
-    jacobian = torch.randn(1, 32, 16, generator=torch.Generator().manual_seed(2)) * 0.1
-    metric = pullback_metric_exact(suffix, target, jacobian, 8)
-    assert tuple(metric.shape) == (1, 32, 32), metric.shape
-    expected = jacobian[0] @ matrix[:16, :]
-    assert torch.allclose(metric[0], expected, atol=1e-4), \
-        "transported metric disagrees with the known linear composition"
-    out["linear_composition_max_gap"] = float((metric[0] - expected).abs().max())
-    error = torch.randn(1, 16, 2, generator=torch.Generator().manual_seed(3)) * 0.05
-    value = float(pullback_quadratic(metric, error))
-    manual = float((torch.bmm(metric, error.flatten(1).unsqueeze(-1)) ** 2).sum())
-    assert abs(value - manual) < 1e-4 * max(manual, 1.0)
-    out["quadratic_matches_manual"] = value
-    out["exact_trace_matches"] = abs(
-        float(pullback_trace(metric)) - float(expected.square().sum())) < 1e-3
-    probes = pullback_probes(suffix, target, jacobian, 8, num_probes=4)
-    assert probes.shape == (1, 4, 32), probes.shape
-    out["sketch_shape"] = list(probes.shape)
-    out["sketch_trace_ratio"] = (float(pullback_trace(probes, sketch=True)) /
-                                 max(float(pullback_trace(metric)), 1e-12))
-    try:
-        pullback_quadratic(metric, error[:, :8, :])
-    except ValueError:
-        out["prefix_error_rejected"] = True
-    else:
-        raise AssertionError("a truncated prefix error was accepted as the metric input")
-
-    student = TwoStepStudent(condition_dim=8, horizon=16, action_dim=2, width=32)
-    batch = {k: torch.zeros(4, 16, 2) for k in
-             ("noise", "midpoint", "target_mid", "target_end", "teacher_end")}
-    batch["condition"] = torch.zeros(4, 8)
-    clean = objective(student, batch, "prefix", 8, None, metric_count=2)[1]["penalty"]
-    poisoned = dict(batch)
-    poisoned["target_mid"] = batch["target_mid"].clone()
-    poisoned["target_mid"][:2] = 100.0
-    poisoned["target_end"] = batch["target_end"].clone()
-    poisoned["target_end"][:2] = 100.0
-    dirty = objective(student, poisoned, "prefix", 8, None, metric_count=2)[1]["penalty"]
-    assert torch.allclose(clean, dirty, atol=1e-6), "prefix penalty leaks the unmarked half"
-    whole = objective(student, poisoned, "prefix", 8, None, metric_count=4)[1]["penalty"]
-    assert float(whole) > float(clean)
-    out["prefix_selection"] = dict(marked_only=float(clean), all_examples=float(whole))
-
-    hot = dict(batch)
-    hot["target_mid"] = torch.randn(4, 16, 2) * 3.0
-    hot["target_end"] = torch.randn(4, 16, 2) * 3.0
-    hot_loss, hot_parts = objective(student, hot, "prefix", 8, None, metric_count=0)
-    assert float(hot_parts["penalty"]) > 0.0, "nonzero errors must produce a nonzero prefix penalty"
-    student.zero_grad()
-    hot_loss.backward()
-    grads = [p.grad for p in student.parameters() if p.grad is not None]
-    assert grads and all(torch.isfinite(g).all() for g in grads), "nonfinite gradients on nonzero errors"
-    assert sum(float(g.square().sum()) for g in grads) > 0.0, "zero-error fixture concealed a dead penalty: nonzero errors give no gradient"
-    out["nonzero_error_gradient"] = float(sum(float(g.square().sum()) for g in grads))
-    loss, _ = objective(student, batch, "uniform", 8, None, metric_count=2)
-    loss.backward()
-    out["uniform_without_metrics_ok"] = float(loss)
-    try:
-        objective(student, batch, "pullback", 8, None, metric_count=2)
-    except (KeyError, ValueError):
-        out["pullback_without_metric_rejected"] = True
-    else:
-        raise AssertionError("metric mode ran without metric tensors")
-
-    guard = torch.nn.Linear(2, 2)
-    guard.weight.grad = torch.full_like(guard.weight, float("inf"))
-    try:
-        torch.nn.utils.clip_grad_norm_(guard.parameters(), 1.0, error_if_nonfinite=True)
-    except Exception:
-        out["nonfinite_gradient_rejected"] = True
-    else:
-        raise AssertionError("nonfinite gradient accepted")
-    return out
 
 
 if __name__ == "__main__":

@@ -1,8 +1,0 @@
-{
-  "state": "complete",
-  "artifact": "smoke_report.json",
-  "bytes": 7420,
-  "detail": {
-    "passed": true
-  }
-}

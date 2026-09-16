@@ -1,9 +1,16 @@
+"""HRI Push-T adapter for the latent-controllability experiment.
+
+Self-contained (does not import execution-pullback): checkpoint loading,
+514-dim condition encoding, action preparation/clipping, environment
+wrappers, replay with the terminal/truncated absorbing rule, plus the
+``field`` closure that exposes the frozen teacher as
+``field(state, times, condition)`` for ``gad_reference.teacher_endpoint``.
+"""
 import numpy as np
 import torch
 
-from core import HORIZON, ACTION_DIM, freeze, integrate
-
-
+HORIZON = 16
+ACTION_DIM = 2
 EXPECTED_KEYS = ("vision_encoder", "noise_pred_net")
 CONDITION_DIM = 514
 ACTION_LOW = 0.0
@@ -11,13 +18,14 @@ ACTION_HIGH = 512.0
 SUCCESS_COVERAGE = 0.95
 
 
-def load_checkpoint(path, device):
-    """Strict load with the modules moved onto `device`.
+def freeze(module):
+    module.eval()
+    module.requires_grad_(False)
+    return module
 
-    map_location only decides where the tensors are materialised; it does not
-    move the receiving modules, so an explicit `.to(device)` is required before
-    any observation or noisy action is placed on the accelerator.
-    """
+
+def load_checkpoint(path, device):
+    """Strict load with modules moved onto `device`."""
     import resnet
     import unet
     device = torch.device(device)
@@ -50,11 +58,6 @@ def _device_key(device):
 
 
 def check_devices(vision_encoder, noise_pred_net, condition, actions, device):
-    """Every tensor that participates in the forward pass must live on `device`.
-
-    CUDA indices are normalized, so "cuda" and "cuda:0" compare equal instead of
-    falsely failing.
-    """
     expected = _device_key(device)
     actual = {_device_key(next(vision_encoder.parameters()).device),
               _device_key(next(noise_pred_net.parameters()).device),
@@ -90,33 +93,7 @@ def make_field(noise_pred_net):
     return field
 
 
-def teacher_rollout(noise_pred_net, noise, condition, steps):
-    return integrate(make_field(noise_pred_net), noise, condition, 0.0, 1.0, steps)
-
-
-def teacher_half_maps(noise_pred_net, noise, condition, steps=16):
-    half = steps // 2
-    mid = integrate(make_field(noise_pred_net), noise, condition, 0.0, 0.5, half)
-    end = integrate(make_field(noise_pred_net), mid, condition, 0.5, 1.0, steps - half)
-    return mid, end
-
-
-def teacher_half_from(midpoint, noise_pred_net, condition, steps=16):
-    second = steps - steps // 2
-    return integrate(make_field(noise_pred_net), midpoint, condition, 0.5, 1.0, second)
-
-
-def check_half_map_consistency(noise_pred_net, noise, condition, steps=16, tol=1e-4):
-    full = teacher_rollout(noise_pred_net, noise, condition, steps)
-    mid, end = teacher_half_maps(noise_pred_net, noise, condition, steps)
-    gap = (full - end).abs().max().item()
-    if not np.isfinite(gap) or gap > tol:
-        raise ValueError("half map consistency check failed")
-    return gap
-
-
 def validate_stats(stats):
-    """Check normalizer bounds, spans, and finiteness before any use."""
     for key in ("action", "agent_pos"):
         if key not in stats:
             raise ValueError("normalizer lacks " + key)
@@ -154,22 +131,6 @@ def resolve_device(name):
     return device
 
 
-def check_batch_independence(noise_pred_net, device=None, generator=None):
-    device = torch.device(device) if device is not None else \
-        next(noise_pred_net.parameters()).device
-    noise_pred_net.eval()
-    first = torch.randn(2, HORIZON, ACTION_DIM, device=device, generator=generator)
-    cond = torch.randn(2, CONDITION_DIM, device=device, generator=generator)
-    times = torch.zeros(2, device=device)
-    with torch.no_grad():
-        out_single = noise_pred_net(first[:1], times[:1], global_cond=cond[:1])
-        out_batch = noise_pred_net(first, times, global_cond=cond)
-    gap = (out_single - out_batch[:1]).abs().max().item()
-    if not np.isfinite(gap) or gap > 1e-5:
-        raise ValueError("teacher forward pass is not batch independent")
-    return gap
-
-
 class HRIAdapter:
     def __init__(self, vision_encoder, noise_pred_net, stats, device,
                  legacy=False, clip_actions=False):
@@ -185,6 +146,22 @@ class HRIAdapter:
             if _device_key(next(module.parameters()).device) != _device_key(self.device):
                 raise ValueError(f"{name} device does not match adapter device")
 
+    def field(self, state, times, condition):
+        """Frozen-teacher vector field for gad_reference.teacher_endpoint."""
+        return self.noise_pred_net(state, times, global_cond=condition)
+
+    def teacher_action(self, q, condition, steps, source="gaussian"):
+        """Full teacher map q -> action chunk, detached FP32, no grad."""
+        import sys
+        import os
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from gad_reference import teacher_endpoint
+        with torch.no_grad():
+            out = teacher_endpoint(self.field, q, condition, steps, source=source)
+        if not torch.isfinite(out).all():
+            raise ValueError("nonfinite teacher action")
+        return out.detach().to(dtype=torch.float32)
+
     def new_env(self, image):
         import pusht
         if image:
@@ -196,10 +173,6 @@ class HRIAdapter:
         return env.reset()
 
     def raw_step(self, env, action):
-        """Step with finite checking only: no clipping, no flag merging.
-
-        Returns (obs, reward, terminated, truncated, done).
-        """
         action = np.asarray(action, dtype=np.float64)
         if action.shape != (2,):
             raise ValueError("action shape must be (2,)")
@@ -215,10 +188,6 @@ class HRIAdapter:
         truncated = bool(truncated)
         return obs, float(reward), terminated, truncated, bool(terminated or truncated)
 
-    def step(self, env, action):
-        obs, reward, terminated, truncated, done = self.raw_step(env, action)
-        return obs, reward, done, dict(terminated=terminated, truncated=truncated)
-
     def decode_raw(self, normalized_prefix):
         physical = np.asarray(decode_actions(normalized_prefix, self.stats))
         if not np.isfinite(physical).all():
@@ -226,13 +195,6 @@ class HRIAdapter:
         return physical
 
     def prepare_commands(self, normalized_prefix):
-        """Single command-preparation pathway used by collection, counterfactual
-        execution, and evaluation: decode raw, record raw violations, clip once
-        if configured, then return the exact commands to execute.
-
-        Counters are reported per COORDINATE for raw and executed violations, and
-        the clip fraction uses the same coordinate denominator as the raw count.
-        """
         raw = self.decode_raw(normalized_prefix)
         flat = raw.reshape(-1, 2)
         invalid = (flat < ACTION_LOW) | (flat > ACTION_HIGH)
@@ -272,12 +234,10 @@ class HRIAdapter:
     def replay(self, scene, history):
         """Replay a history; returns (env, terminal, truncated).
 
-        Explicit rule: a history ending exactly at termination replays
-        cleanly with terminal=True; histories continuing past termination
-        are rejected; truncation is reported, never ignored. Callers must
-        not step an env whose replayed state is terminal: derivative
-        construction from a terminal context uses absorbing-state features
-        (the terminal features, repeated) without additional stepping.
+        A history ending exactly at termination replays cleanly with
+        terminal=True; histories continuing past termination are rejected.
+        Never step an env whose replayed state is terminal OR truncated:
+        use absorbing-state features instead.
         """
         env = self.new_env(image=False)
         self.reset(env, scene)
@@ -294,8 +254,8 @@ class HRIAdapter:
 
     def execute_from_history(self, scene, history, normalized_prefix):
         commands = self.commands_for_execution(normalized_prefix)
-        env, terminal, _ = self.replay(scene, history)
-        if terminal:
+        env, terminal, truncated = self.replay(scene, history)
+        if terminal or truncated:
             frozen = self.features(env)
             env.close()
             return np.concatenate([frozen] * len(commands))
@@ -325,44 +285,6 @@ class HRIAdapter:
             raise ValueError(f"replay signature mismatch (scene {scene}, "
                              f"gap {gap}, tol {tol})")
         return gap
-
-    def check_transition_equivalence(self, scene, history, new_action, tol=1e-9):
-        """Image environment and state environment must agree on the transition
-        produced by the same recorded prefix plus one action."""
-        state_env = self.new_env(image=False)
-        self.reset(state_env, scene)
-        try:
-            for action in history:
-                _, _, terminated, _, _ = self.raw_step(state_env, action)
-                if terminated:
-                    raise ValueError("history terminated during state replay")
-            state_before = self.signature(state_env)
-            for action in np.asarray(new_action, dtype=np.float64):
-                self.raw_step(state_env, action)
-            state_after = self.signature(state_env)
-        finally:
-            state_env.close()
-        image_env = self.new_env(image=True)
-        self.reset(image_env, scene)
-        try:
-            for action in history:
-                _, _, terminated, _, _ = self.raw_step(image_env, action)
-                if terminated:
-                    raise ValueError("history terminated during image replay")
-            image_before = self.signature(image_env)
-            for action in np.asarray(new_action, dtype=np.float64):
-                self.raw_step(image_env, action)
-            image_after = self.signature(image_env)
-        finally:
-            image_env.close()
-        before_gap = float(np.abs(state_before - image_before).max())
-        after_gap = float(np.abs(state_after - image_after).max())
-        if not (np.isfinite(before_gap) and np.isfinite(after_gap)):
-            raise ValueError("nonfinite transition comparison")
-        if max(before_gap, after_gap) > tol:
-            raise ValueError(f"image and state environments disagree "
-                             f"(before {before_gap}, after {after_gap})")
-        return dict(before=before_gap, after=after_gap)
 
     def encode_observation(self, image, agent_pos):
         image_t = torch.from_numpy(np.asarray(image)).unsqueeze(0).to(
