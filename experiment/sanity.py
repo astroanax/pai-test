@@ -94,6 +94,7 @@ def synthetic_context(scene, split, rng, with_metric=False, metric_mode="exact")
                "history": [], "signature_initial": [0.0],
                "signature_live": [0.0]}
     if with_metric:
+        context["has_metric"] = True
         context["jacobian_start"] = rng.standard_normal((32, 16)).astype(np.float32)
         context["jacobian_end"] = rng.standard_normal((32, 16)).astype(np.float32)
         if metric_mode == "exact":
@@ -206,12 +207,22 @@ def check_empty_metric_count():
              ("noise", "midpoint", "target_mid", "target_end", "teacher_end")}
     batch["condition"] = torch.zeros(4, 8)
     for count in (0, None):
-        loss, parts = objective(student, batch, "prefix", 8, None,
+        loss, parts = objective(student, batch, "uniform", 8, None,
                                 metric_count=count)
-        assert torch.isfinite(loss), f"prefix with metric_count={count} is nonfinite"
+        assert torch.isfinite(loss), f"uniform with metric_count={count} is nonfinite"
         assert float(parts["penalty"]) == 0.0, \
-            f"empty selection must carry zero penalty, got {parts['penalty']}"
-    return dict(empty_count_yields_zero_penalty=True)
+            f"uniform with empty selection must carry zero physical penalty, got {parts['penalty']}"
+    loss, parts = objective(student, batch, "prefix", 8, None,
+                            metric_count=0)
+    assert torch.isfinite(loss), "label-only prefix is nonfinite"
+    hot_batch = {k: (v if k == "condition" else torch.randn_like(v) * 2.0)
+                 for k, v in batch.items()}
+    _, hot_parts = objective(student, hot_batch, "prefix", 8, None,
+                             metric_count=0)
+    assert float(hot_parts["penalty"]) > 0.0, \
+        "label-only prefix must weight early steps over the whole batch, not zero it"
+    return dict(empty_count_yields_zero_physical_penalty=True,
+                label_only_prefix_covers_whole_batch=True)
 
 
 def check_warm_provenance_roles(config, tmpdir):
@@ -419,7 +430,8 @@ def check_protocol_and_analysis(config, config_path, tmpdir):
     partial = [r for r in good if not (r["training_seed"] == 1 and r["scene"] == 10)]
     try:
         C.require_complete(partial, protocol, "pullback", "endpoint")
-    except ValueError:
+    except ValueError as error:
+        assert "MISSING_EPISODE" in str(error), str(error)
         protocols["joint_missing_pair_rejected"] = True
     else:
         raise AssertionError("joint missing pair accepted")
@@ -456,13 +468,89 @@ def check_protocol_and_analysis(config, config_path, tmpdir):
     return protocols
 
 
+def check_mixed_cache_diagnostic(config):
+    import sys as _sys
+    _sys.path.insert(0, HERE)
+    import diagnose as D
+    rng = np.random.default_rng(3)
+    small = dict(config, validation_metric_contexts=8)
+    train_scenes = sorted(C.scene_range(config, "train"))[:2]
+    val_scenes = sorted(C.scene_range(config, "validation"))[:4]
+    contexts = []
+    for scene in val_scenes:
+        for k in range(4):
+            contexts.append(synthetic_context(scene, "validation", rng,
+                                              with_metric=(k < 2)))
+    for scene in train_scenes:
+        contexts.append(synthetic_context(scene, "train", rng))
+    rows = D.validation_rows(contexts, small, per_scene=2, max_contexts=16)
+    assert rows, "mixed cache yielded no diagnostic rows"
+    for i in rows:
+        assert contexts[i].get("has_metric"), f"diagnostic row {i} lacks metric tensors"
+        assert contexts[i]["split"] == "validation"
+    scenes = {int(contexts[i]["scene"]) for i in rows}
+    assert len(scenes) >= 2, f"rows concentrate in {scenes}"
+    return dict(rows=len(rows), scenes=sorted(scenes), all_metric_labelled=True)
+
+
+def check_mutated_lock_rejected(config, config_path):
+    import copy
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as tmpdir:
+        smoke = os.path.join(tmpdir, "smoke.json")
+        cache = os.path.join(tmpdir, "cache.npz")
+        warm = os.path.join(tmpdir, "warm.pt")
+        with open(smoke, "w") as handle:
+            handle.write("{}")
+        np.savez(cache, contexts=np.zeros(1))
+        with open(warm, "wb") as handle:
+            handle.write(b"warm")
+        choices = C.canonical_choices(config, ["uniform"], [0], 1, warm, cache,
+                                      smoke, final_scenes=[10],
+                                      primary_contrast=["uniform", "pullback"])
+        protocol = dict(protocol_id="x", modes=["uniform"], seeds=[0],
+                        updates=1, final_scenes=[10],
+                        primary_contrast=["uniform", "pullback"],
+                        canonical_choices=choices,
+                        source_hashes=C.source_hashes(),
+                        resolved_config=config)
+        mutated = copy.deepcopy(protocol)
+        mutated["final_scenes"] = [11]
+        try:
+            C.verify_current_protocol(mutated, config, config_path)
+        except C.ProtocolError as error:
+            assert "final_scenes" in str(error) or "identifier" in str(error), str(error)
+        else:
+            raise AssertionError("mutated lock passed the real verifier")
+        mutated2 = copy.deepcopy(protocol)
+        mutated2["canonical_choices"] = dict(choices, updates=999)
+        try:
+            C.verify_current_protocol(mutated2, config, config_path)
+        except C.ProtocolError as error:
+            assert "identifier" in str(error) or "canonical" in str(error), str(error)
+        else:
+            raise AssertionError("mutated canonical payload passed the real verifier")
+    return dict(scene_edit_rejected=True, canonical_edit_rejected=True)
+
+
 def check_manifest():
     manifest_path = os.path.join(HERE, "MANIFEST.json")
-    payload = C.write_manifest(manifest_path)
+    with open(manifest_path) as handle:
+        on_disk = json.load(handle)
+    assert on_disk["files"] == C.source_hashes(), \
+        "MANIFEST.json is stale: regenerate it, never tested stale"
     verified = C.verify_manifest(manifest_path)
+    assert verified["verified"] == len(on_disk["files"]), verified
     manifest = C.check_manifest()
     assert not manifest["missing"], f"missing sources: {manifest['missing']}"
-    return dict(files=payload["count"], verified=verified["verified"],
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fixture = os.path.join(tmpdir, "MANIFEST.json")
+        with open(fixture, "w") as handle:
+            json.dump(on_disk, handle)
+        re_verified = C.verify_manifest(
+            fixture, experiment_dir_override=HERE)
+        assert re_verified["verified"] == verified["verified"]
+    return dict(files=verified["verified"],
                 delivery_risk=manifest["delivery_risk"][:4])
 
 
@@ -474,7 +562,8 @@ def main():
     results = {"metric_subset_spread": check_metric_subset_spread(config),
                "canonical_binding": check_canonical_binding(config),
                "duplicate_episodes": check_duplicate_episodes_rejected(),
-               "development_eval_gate": check_development_eval_gate(),
+               "mixed_cache_diagnostic": check_mixed_cache_diagnostic(config),
+               "mutated_lock_rejected": check_mutated_lock_rejected(config, config_path),
                "linear_algebra": check_linear_algebra(),
                "config_validation": check_config_validation(),
                "spearman_ties": check_spearman(),
@@ -488,6 +577,7 @@ def main():
             config, config_path, tmpdir)
     try:
         import torch
+        results["development_eval_gate"] = check_development_eval_gate()
         results["empty_metric_count"] = check_empty_metric_count()
         results["device_keys"] = check_device_key_normalization()
         from core import (TwoStepStudent, objective, pullback_metric_exact,
@@ -500,6 +590,13 @@ def main():
         if args.require_torch:
             raise
         results["torch_checks"] = "skipped (torch unavailable)"
+    def _sweep(node, trail=""):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                _sweep(value, trail + "/" + str(key))
+        elif node is False:
+            raise AssertionError(f"sanity check reported False at {trail}")
+    _sweep(results)
     print("sanity " + json.dumps(results, default=str))
     return 0
 
@@ -559,6 +656,17 @@ def check_torch(torch, TwoStepStudent, objective, pullback_metric_exact,
     assert float(whole) > float(clean)
     out["prefix_selection"] = dict(marked_only=float(clean), all_examples=float(whole))
 
+    hot = dict(batch)
+    hot["target_mid"] = torch.randn(4, 16, 2) * 3.0
+    hot["target_end"] = torch.randn(4, 16, 2) * 3.0
+    hot_loss, hot_parts = objective(student, hot, "prefix", 8, None, metric_count=0)
+    assert float(hot_parts["penalty"]) > 0.0, "nonzero errors must produce a nonzero prefix penalty"
+    student.zero_grad()
+    hot_loss.backward()
+    grads = [p.grad for p in student.parameters() if p.grad is not None]
+    assert grads and all(torch.isfinite(g).all() for g in grads), "nonfinite gradients on nonzero errors"
+    assert sum(float(g.square().sum()) for g in grads) > 0.0, "zero-error fixture concealed a dead penalty: nonzero errors give no gradient"
+    out["nonzero_error_gradient"] = float(sum(float(g.square().sum()) for g in grads))
     loss, _ = objective(student, batch, "uniform", 8, None, metric_count=2)
     loss.backward()
     out["uniform_without_metrics_ok"] = float(loss)

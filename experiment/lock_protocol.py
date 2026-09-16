@@ -34,9 +34,16 @@ def main():
     parser.add_argument("--min-support", type=int, default=8,
                         help="minimum positive-trace support per scale before "
                              "final training (0 only for a tiny vertical test)")
+    parser.add_argument("--min-metric-scenes", type=int, default=2,
+                        help="minimum distinct scenes among metric-labelled "
+                             "training contexts (0 only for a tiny vertical "
+                             "test)")
     parser.add_argument("--declare-teacher-ref", action="store_true",
                         help="declare the reference-teacher evaluation as a "
                              "required reference in the analysis")
+    parser.add_argument("--kind", choices=("integration_test", "principal_experiment"),
+                        default="principal_experiment",
+                        help="schema tag: tiny integration runs must never be mistaken for the principal comparison")
     parser.add_argument("--declare-native-fast-ref", action="store_true",
                         help="declare the native-fast baseline evaluation as a "
                              "required reference in the analysis")
@@ -63,6 +70,7 @@ def main():
                                   "identity", "scalar")]
     if unknown_modes:
         raise ValueError(f"unknown modes {unknown_modes}")
+    args.seeds = C.normalize_seeds(args.seeds or [0, 1])
     if not args.seeds or len(set(int(s) for s in args.seeds)) != len(args.seeds):
         raise ValueError(f"seeds must be nonempty with no duplicates: {args.seeds}")
     if any(int(s) < 0 for s in args.seeds):
@@ -88,12 +96,58 @@ def main():
     allowed = C.scene_range(config, "train") | C.scene_range(config, "validation")
     verified = C.verify_label_cache(args.cache, config, expect_mode="shared",
                                     allowed_scenes=allowed, require_metric=True)
-    train_rows, validation_rows = C.metric_subset(verified, config)
+    # Coverage is counted from ACTUAL metric-labelled contexts (has_metric),
+    # never from the planned subset size: metric_subset() returns the planned
+    # rows, which overstates coverage when the metrics stage labelled fewer.
+    metric_train = [c for c in C.select_split(verified, "train")
+                    if c.get("has_metric", False)]
+    metric_validation = [c for c in C.select_split(verified, "validation")
+                         if c.get("has_metric", False)]
+    if verified["meta"].get("profile"):
+        raise ValueError("metric cache is a profile (--limit) cache; rebuild "
+                         "the full cache before locking the principal protocol")
+    # Cross-check the actual labels against the membership the metric
+    # producer declared: a cache whose has_metric rows disagree with the
+    # producer's member_keys was edited or mixed after the metrics stage.
+    lineage = verified.get("lineage") or {}
+    collector = lineage.get("collector")
+    collector_hash = lineage.get("collector_sha256")
+    if collector is None or collector_hash is None:
+        raise ValueError("metric cache lineage lacks the collector checkpoint (pre-schema cache); rebuild the metrics stage")
+    if collector != args.warm or collector_hash != C.sha256_file(args.warm):
+        raise ValueError("metric cache was not collected by the locked warm start: collector " + repr(collector) + " vs warm " + repr(args.warm) + "; recollect from the warm checkpoint")
+    declared = verified["meta"].get("member_keys")
+    if declared is not None:
+        def _key(context):
+            return (int(context["scene"]), str(context["split"]),
+                    int(context["decision"]), int(context["step"]))
+        declared_keys = {tuple(k) if not isinstance(k, list)
+                         else (int(k[0]), str(k[1]), int(k[2]), int(k[3]))
+                         for k in declared}
+        actual_keys = {_key(c) for c in metric_train + metric_validation}
+        if actual_keys != declared_keys:
+            raise ValueError(
+                "metric-labelled contexts disagree with the producer's "
+                f"declared membership: {len(actual_keys)} actual vs "
+                f"{len(declared_keys)} declared; rebuild the metrics stage")
     required_rows = int(config["metric_contexts"]) * args.min_metric_fraction
-    if len(train_rows) < required_rows:
-        raise ValueError(f"metric cache holds {len(train_rows)} training contexts, "
-                         f"below {args.min_metric_fraction:.0%} of the planned "
-                         f"{config['metric_contexts']}")
+    if len(metric_train) < required_rows:
+        raise ValueError(f"metric cache holds {len(metric_train)} metric-labelled "
+                         f"training contexts, below {args.min_metric_fraction:.0%} "
+                         f"of the planned {config['metric_contexts']}")
+    required_validation = int(config["validation_metric_contexts"]) * \
+        args.min_metric_fraction
+    if len(metric_validation) < required_validation:
+        raise ValueError(f"metric cache holds {len(metric_validation)} metric-labelled "
+                         f"validation contexts, below {args.min_metric_fraction:.0%} "
+                         f"of the planned {config['validation_metric_contexts']}; "
+                         "run the metrics stage for the validation split")
+    metric_scenes = sorted({int(c["scene"]) for c in metric_train})
+    if len(metric_scenes) < int(args.min_metric_scenes):
+        raise ValueError(f"metric-labelled training contexts cover "
+                         f"{len(metric_scenes)} distinct scenes "
+                         f"({metric_scenes[:5]}), below min-metric-scenes "
+                         f"{args.min_metric_scenes}")
     with open(args.smoke_report) as handle:
         smoke = json.load(handle)
     if not smoke.get("passed"):
@@ -165,26 +219,37 @@ def main():
         scale_stats = dict(support={}, note="no metric modes locked")
 
     compute = C.apply_compute_env(config["device"])
+    eval_noise = dict(replicate=0, key="(eval_replicate, scene, decision)",
+                      source=config["source"],
+                      teacher_steps=int(config["teacher_steps"]))
+    references = {}
+    if args.declare_teacher_ref:
+        references["teacher"] = dict(
+            method="teacher", role="teacher_reference",
+            steps=int(config["teacher_steps"]),
+            source=config["source"], scenes=final_scenes, replicate=0,
+            checkpoint_sha256=C.sha256_file(config["checkpoint"]))
+    if args.declare_native_fast_ref:
+        references["native_fast"] = dict(
+            method="native_fast", role="native_fast_reference",
+            steps=int(config["native_fast_steps"]),
+            source=config["native_fast_source"], scenes=final_scenes,
+            replicate=0,
+            checkpoint_sha256=C.sha256_file(config["checkpoint"]))
     protocol_id, parts = C.protocol_id(config, args.config, args.cache, args.warm,
                                        args.modes, args.seeds, args.updates,
                                        smoke_report=args.smoke_report,
                                        final_scenes=final_scenes,
                                        primary_contrast=primary_contrast,
-                                       compute=compute)
-    references = {}
-    if args.declare_teacher_ref:
-        references["teacher"] = dict(
-            method="teacher", steps=int(config["teacher_steps"]),
-            source=config["source"], scenes=final_scenes)
-    if args.declare_native_fast_ref:
-        references["native_fast"] = dict(
-            method="native_fast",
-            steps=int(config["native_fast_steps"]),
-            source=config["native_fast_source"], scenes=final_scenes)
+                                       compute=compute, references=references,
+                                       eval_noise=eval_noise, kind=args.kind)
     protocol = dict(
         protocol_id=protocol_id, schema_version=C.SCHEMA_VERSION,
-        metric_subset=dict(train=len(train_rows), validation=len(validation_rows),
-                           available=verified["n_contexts"]),
+        metric_subset=dict(train=len(metric_train),
+                           validation=len(metric_validation),
+                           metric_scenes=metric_scenes,
+                           available=verified["n_contexts"],
+                           n_metric_labelled=verified["n_metric"]),
         experiment="execution-pullback pilot",
         mode="single shared warm start, independent fine-tuning seeds",
         modes=list(args.modes), seeds=[int(s) for s in args.seeds],
@@ -211,12 +276,16 @@ def main():
         native_fast=dict(steps=int(config["native_fast_steps"]),
                          source=config["native_fast_source"]),
         references=references,
+        eval_noise=eval_noise,
         lock_support=scale_stats,
         compute=compute,
         smoke_report=args.smoke_report,
         smoke_report_sha256=C.sha256_file(args.smoke_report),
         resolved_config=config,
+        experiment_kind=args.kind,
         min_metric_fraction=float(args.min_metric_fraction),
+        min_metric_scenes=int(args.min_metric_scenes),
+        min_support=int(args.min_support),
         final_prefix=args.final_prefix,
         test_episodes_planned=len(final_scenes),
         no_final_results_examined=True)

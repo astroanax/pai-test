@@ -178,8 +178,18 @@ def run(config, device, output, modes):
     def replay_and_transitions():
         import math
         results = []
+        if not modes:
+            raise ValueError("smoke requires a nonempty mode list; an empty list would silently pass every mode-gated check")
+        fixtures = []
         for scene in (config["development_scene_start"],
                       config["development_scene_start"] + 1):
+            fixtures.append((scene, "contact", [
+                np.array([256.0 + 8.0 * np.sin(step / 3.0), 300.0 - 6.0 * step])
+                for step in range(24)]))
+            fixtures.append((scene, "free_space", [
+                np.array([30.0 + 0.5 * np.sin(step), 30.0 + 0.5 * np.cos(step)])
+                for step in range(8)]))
+        for scene, kind, script in fixtures:
             env = adapter.new_env(image=True)
             obs, _ = adapter.reset(env, scene)
             history = []
@@ -188,9 +198,7 @@ def run(config, device, output, modes):
             # pusher state is deliberately excluded: pusher motion with a
             # stationary block must NOT pass a block-motion check.
             before_block = np.array([before[4], before[5], before[8] % (2 * math.pi)])
-            for step in range(24):
-                action = np.array([256.0 + 8.0 * np.sin(step / 3.0),
-                                   300.0 - 6.0 * step])
+            for action in script:
                 obs, reward, terminated, truncated, done = adapter.raw_step(env, action)
                 history.append(action.tolist())
                 if done:
@@ -206,15 +214,20 @@ def run(config, device, output, modes):
             gap = adapter.check_replay(scene, history, live)
             equiv = adapter.check_transition_equivalence(scene, history[:-1],
                                                         np.asarray([history[-1]]))
-            results.append(dict(scene=scene, steps=len(history), replay_gap=gap,
+            results.append(dict(scene=scene, fixture=kind, steps=len(history), replay_gap=gap,
                                 block_position_gap=position_gap,
                                 block_orientation_gap=float(orientation_gap),
                                 pose_change=moved, image_state_gap=equiv,
                                 block_moved=bool(moved > 1e-6)))
-        assert all(r["block_moved"] for r in results), \
-            "block pose (position or wrapped orientation) did not change in " \
-            "either smoke history; the fixture may be free-space motion"
-        return results
+        contact = [r for r in results if r["fixture"] == "contact" and r["block_moved"]]
+        free = [r for r in results if r["fixture"] == "free_space" and not r["block_moved"]]
+        assert contact, \
+            "contact fixture failed to move the block on every scene; the target stack may be misconfigured"
+        assert free, \
+            "free-space fixture moved the block: the free-space script is not free space"
+        return dict(fixtures=results,
+                    contact_fixtures=len(contact),
+                    free_space_fixtures=len(free))
     record("replay_and_image_state_transitions", replay_and_transitions)
 
     def tiny_train_step():

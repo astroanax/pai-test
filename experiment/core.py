@@ -120,10 +120,13 @@ def pullback_probes(suffix, target, physical_jacobian, execute_steps, num_probes
     """Sketched metric: L random-probe VJPs transported to the solver input.
 
     probes[b, l] = J_prefix^T B0^T xi_l, so (probes_l . e)^2 = (xi_l . C e)^2 and
-    E_l (probes_l . e)^2 = ||C e||^2 = ||C||_F^2 for the trace. Both are unbiased
-    for a FIXED error, but with L fixed the sketch has rank <= L: directions in
-    the null space of the sketch stay unpenalized and the student can adapt to
-    the particular sketch. Use pullback_metric_exact unless the sketch is the
+    E_l (probes_l . e)^2 = ||C e||^2 for a FIXED error e, while E over probe
+    draws of the probe second moment gives the Frobenius norm ||C||_F^2 for
+    the trace. The two identities are different quantities: Q(e) = ||Ce||^2
+    evaluates one error direction, tr(C^T C) = ||C||_F^2 sums over all of
+    them. With L fixed the sketch has rank <= L: directions in the null
+    space of the sketch stay unpenalized and the student can adapt to the
+    particular sketch. Use pullback_metric_exact unless the sketch is the
     declared object of study.
     """
     if num_probes < 1:
@@ -171,9 +174,14 @@ def pullback_metric_exact(suffix, target, physical_jacobian, execute_steps):
     horizon * action_dim, is built with one VJP per prefix output coordinate
     (prefix_dim backwards passes, no extra simulator branches). Then
 
-        Q0(e) = ||C e||^2 ,     tr M = ||C||_F^2
+        Q0(e) = ||C e||^2 ,     tr(C^T C) = ||C||_F^2
 
-    is the exact rank-full quadratic form, replacing the rank-<=L sketch. The
+    Q and tr are different quantities: the quadratic evaluates one fixed
+    error, the trace sums over all directions. For C = B J_prefix with m
+    executed actions, rank(C) <= 2m (at most 16 for 8 steps on a
+    32-dimensional chunk): this is an unsketched pullback operator built
+    from finite-difference physical sensitivities, not a full-rank exact
+    nonlinear execution-loss metric, and it replaces the rank-<=L sketch. The
     returned tensor is C with shape (batch, output_dim, horizon * action_dim);
     its last axis covers the WHOLE noisy action chunk, not just the executed
     prefix, so it must never be truncated to prefix_dim columns.
@@ -274,7 +282,13 @@ def objective(student, batch, mode, execute_steps, scales=None, metric_weight=0.
     else:
         selected = None
     if selected is None:
-        penalty = base.new_zeros(())
+        if mode == "prefix":
+            whole = slice(None)
+            early = mid_error[whole, :execute_steps]
+            late = end_error[whole, :execute_steps]
+            penalty = 0.5 * (early.square().mean() + late.square().mean())
+        else:
+            penalty = base.new_zeros(())
     elif mode == "prefix":
         early = mid_error[selected, :execute_steps]
         late = end_error[selected, :execute_steps]

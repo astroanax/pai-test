@@ -88,16 +88,16 @@ def reference_table(frame, protocol):
         if subset.empty:
             raise ValueError(f"declared reference {name} has no evaluation rows; "
                              "pass its file or remove it from the lock")
-        scenes = sorted(int(s) for s in subset["scene"].unique())
-        if scenes != sorted(int(s) for s in spec.get("scenes", [])):
-            raise ValueError(f"reference {name} scenes {scenes[:5]} != "
-                             f"planned {spec.get('scenes', [])[:5]}")
+        records = subset.to_dict("records")
+        C.validate_reference_rows(records, spec, protocol)
         rows.append(dict(name=name, method=spec.get("method", name),
                          n=int(len(subset)),
                          success=float(subset["success"].mean()),
                          score=float(subset["score"].mean()),
                          latency_median_ms=float(
                              subset["decision_latency_median_ms"].median()),
+                         head_latency_median_ms=float(
+                             subset["action_head_latency_median_ms"].median()),
                          spec=spec))
     return rows
 
@@ -127,10 +127,13 @@ def main():
     for path in args.inputs:
         if not os.path.exists(path):
             raise ValueError("missing evaluation file " + path)
-        if not C.is_complete(path):
-            raise ValueError(f"{path} has no completion record; a partial "
-                             "evaluation must not reach the analysis")
+        C.verify_completed(path, role=None, protocol=protocol)
+        sidecar = path.replace(".jsonl", ".meta.json")
         rows = [json.loads(line) for line in open(path) if line.strip()]
+        with open(sidecar) as handle:
+            meta = json.load(handle)
+        if meta.get("scenes") is not None and len(meta["scenes"]) != len(rows):
+            raise ValueError(f"MISSING_EPISODE: {path} holds {len(rows)} rows for sidecar scenes {meta['scenes']}; refusing to concatenate")
         if not rows:
             raise ValueError("empty evaluation file " + path)
         for row in rows:
@@ -139,6 +142,12 @@ def main():
                                  f"!= locked {protocol.get('protocol_id')}")
         frames.append(pd.DataFrame(rows))
     frame = pd.concat(frames, ignore_index=True)
+    for key in ("method", "training_seed", "scene", "success", "eval_role",
+                "eval_replicate", "inference_steps", "checkpoint_sha256"):
+        if key not in frame:
+            raise ValueError("evaluation rows lack " + key + " (pre-schema evaluation; rebuild it)")
+    for row in frame.to_dict("records"):
+        C.validate_eval_row_role(row, protocol)
     for key in ("method", "training_seed", "scene", "success"):
         if key not in frame:
             raise ValueError("evaluation rows lack " + key)

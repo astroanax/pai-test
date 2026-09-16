@@ -46,6 +46,7 @@ python experiment/diagnose.py --config "${CONFIG}" --allow-unlocked \
   || fail "diagnostic"
 
 python experiment/lock_protocol.py --config "${CONFIG}" --confirm-no-final-results \
+  --kind integration_test \
   --modes uniform pullback --seeds 0 1 --updates 5 --test-episodes 2 \
   --min-metric-fraction 0 --min-support 0 --final-prefix "${RUN}/final_" \
   --cache "${RUN}/shared_metrics.npz" --warm "${RUN}/warm.pt" \
@@ -79,12 +80,22 @@ python experiment/analyze.py --config "${CONFIG}" --protocol "${RUN}/protocol_lo
   --inputs "${RUN}"/negative/final_*.jsonl --output "${RUN}/negative/paired_intact.json" \
   || fail "analysis rejected an intact copy (negative-control fixture broken)"
 echo "[vertical] negative control step 1 passed: intact copy accepted"
-# step 2: remove exactly one planned episode and assert the SPECIFIC
-# missing-episode error, not merely any nonzero exit
+# step 2a: byte corruption must trip the hash layer first (ARTIFACT_HASH_MISMATCH),
+# independently of any completeness reasoning
 head -n -1 "${RUN}/negative/final_pullback_seed1.jsonl" > "${RUN}/negative/partial.jsonl" \
   && mv "${RUN}/negative/partial.jsonl" "${RUN}/negative/final_pullback_seed1.jsonl"
-# keep the sidecar consistent with its rows so the failure lands on the
-# missing-pair check (not the sidecar/row agreement check)
+if python experiment/analyze.py --config "${CONFIG}" --protocol "${RUN}/protocol_locked.json" \
+    --inputs "${RUN}"/negative/final_*.jsonl --output "${RUN}/negative/paired.json" \
+    > "${RUN}/negative/analysis_err_hash.txt" 2>&1; then
+  fail "analysis accepted a byte-corrupted evaluation"
+else
+  grep -q "ARTIFACT_HASH_MISMATCH" "${RUN}/negative/analysis_err_hash.txt" \
+    || fail "analysis rejected the corrupted fixture for the wrong reason: $(cat "${RUN}/negative/analysis_err_hash.txt")"
+  echo "[vertical] negative control step 2a passed: hash corruption rejected with ARTIFACT_HASH_MISMATCH"
+fi
+# step 2b: a truncated-but-recompleted fixture (fresh identity record over the
+# truncated bytes, consistent sidecar) must fail on completeness with
+# MISSING_EPISODE -- never silently accepted, never confused with corruption
 python - "${RUN}/negative/final_pullback_seed1.meta.json" <<'PY'
 import json, sys
 path = sys.argv[1]
@@ -92,14 +103,21 @@ meta = json.load(open(path))
 meta["scenes"] = meta["scenes"][:-1]
 json.dump(meta, open(path, "w"), indent=2)
 PY
+python - "${RUN}/negative/final_pullback_seed1.jsonl" "${RUN}/negative/final_pullback_seed1.meta.json" <<'PY'
+import sys
+sys.path.insert(0, "experiment")
+import contract as C
+C.complete_output(sys.argv[1])
+C.complete_output(sys.argv[2])
+PY
 if python experiment/analyze.py --config "${CONFIG}" --protocol "${RUN}/protocol_locked.json" \
     --inputs "${RUN}"/negative/final_*.jsonl --output "${RUN}/negative/paired.json" \
     > "${RUN}/negative/analysis_err.txt" 2>&1; then
   fail "analysis accepted a deliberately incomplete experiment"
 else
-  grep -q -E "missing|incomplete|no evaluation rows" "${RUN}/negative/analysis_err.txt" \
+  grep -q "MISSING_EPISODE" "${RUN}/negative/analysis_err.txt" \
     || fail "analysis rejected the partial fixture for the wrong reason: $(cat "${RUN}/negative/analysis_err.txt")"
-  echo "[vertical] negative control step 2 passed: missing episode rejected for the right reason"
+  echo "[vertical] negative control step 2b passed: missing episode rejected with MISSING_EPISODE"
 fi
 
 echo "[vertical] PASS: all producer/consumer stages ran end to end in ${RUN}"

@@ -270,23 +270,35 @@ class HRIAdapter:
         return values
 
     def replay(self, scene, history):
+        """Replay a history; returns (env, terminal, truncated).
+
+        Explicit rule: a history ending exactly at termination replays
+        cleanly with terminal=True; histories continuing past termination
+        are rejected; truncation is reported, never ignored. Callers must
+        not step an env whose replayed state is terminal: derivative
+        construction from a terminal context uses absorbing-state features
+        (the terminal features, repeated) without additional stepping.
+        """
         env = self.new_env(image=False)
         self.reset(env, scene)
         history = list(history)
+        terminal, truncated = False, False
         for position, action in enumerate(history):
-            _, _, terminated, _, _ = self.raw_step(env, np.asarray(action, dtype=np.float64))
-            # A history that ends exactly at termination is a complete fixture
-            # and must replay cleanly; only actions AFTER termination are
-            # rejected. This keeps the fixture contract and the replay contract
-            # in agreement.
-            if terminated and position < len(history) - 1:
+            _, _, terminated, trunc, _ = self.raw_step(env, np.asarray(action, dtype=np.float64))
+            terminal = bool(terminated)
+            truncated = bool(trunc or truncated)
+            if terminal and position < len(history) - 1:
                 env.close()
                 raise ValueError("history continues after episode termination")
-        return env
+        return env, terminal, truncated
 
     def execute_from_history(self, scene, history, normalized_prefix):
         commands = self.commands_for_execution(normalized_prefix)
-        env = self.replay(scene, history)
+        env, terminal, _ = self.replay(scene, history)
+        if terminal:
+            frozen = self.features(env)
+            env.close()
+            return np.concatenate([frozen] * len(commands))
         features = []
         finished = False
         try:
@@ -303,7 +315,7 @@ class HRIAdapter:
         expected = np.asarray(signature, dtype=np.float64)
         if not np.isfinite(expected).all():
             raise ValueError("recorded replay signature is nonfinite")
-        env = self.replay(scene, history)
+        env, _, _ = self.replay(scene, history)
         try:
             replayed = self.signature(env)
         finally:

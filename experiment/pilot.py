@@ -229,6 +229,8 @@ def cmd_collect(args, config, device):
                 splits={k: len(v) for k, v in seen.items()},
                 contexts=len(contexts), wall_s=round(time.time() - started, 1))
     lineage = dict(source_hashes=C.source_hashes(),
+                   student=args.student,
+                   collector_sha256=checkpoint_hash,
                    checkpoint_sha256=checkpoint_hash,
                    normalizer_sha256=C.sha256_file(config["normalizer"]),
                    mode=meta["mode"], source=source,
@@ -353,6 +355,8 @@ def cmd_metrics(args, config, device):
     meta = dict(schema_version=C.SCHEMA_VERSION, mode="shared",
                 metric_mode=metric_mode,
                 num_probes=config["num_probes"], epsilon=eps,
+                profile=(args.limit is not None),
+                profile_limit=args.limit,
                 counts=dict(train=len(train_rows), validation=len(validation_rows),
                             total=len(full), metric_total=len(out)),
                 member_keys=[list(_context_key(entry)) for entry in out],
@@ -363,9 +367,12 @@ def cmd_metrics(args, config, device):
                 splits={row["split"] for row in full})
     meta["splits"] = {split: sum(1 for row in full if row["split"] == split)
                       for split in sorted({row["split"] for row in full})}
+    parent_lineage = verified.get("lineage") or {}
     lineage = dict(source_hashes=C.source_hashes(),
                    cache=C.sha256_file(args.cache),
                    cache_meta=verified["meta"],
+                   collector=parent_lineage.get("student"),
+                   collector_sha256=parent_lineage.get("collector_sha256"),
                    epsilon=eps, metric_mode=metric_mode)
     C.write_metric_cache(args.output, full, config, meta, lineage)
     print(f"wrote metrics {args.output} contexts {len(full)} "
@@ -391,6 +398,8 @@ def batch_from_contexts(contexts, indices, device, metric_mode, need_metric):
 
 def cmd_train(args, config, device):
     protocol, protocol_id = protocol_for(args, config)
+    if protocol is not None:
+        C.check_compute_against_lock("train", protocol, config, device)
     needs_metric = mode_needs_metric(args.mode)
     # the warm start trains from the teacher cache (mode "teacher"); only metric
     # modes require the shared student-collected cache
@@ -428,6 +437,8 @@ def cmd_train(args, config, device):
                   json.dumps(scale_stats["low_support"]) + " with support " +
                   json.dumps(scale_stats["support"]) +
                   "; the corresponding comparison rests on few contexts")
+    if protocol is not None and args.initial is None:
+        raise C.ProtocolError("locked fine-tuning requires --initial <warm checkpoint>; training from scratch under a lock is not permitted")
     seed_state = torch.load(args.initial, map_location=device,
                             weights_only=True) if args.initial else None
     if seed_state is not None:
@@ -471,8 +482,11 @@ def cmd_train(args, config, device):
     student.train()
     log = []
     grad_norms = []
+    batch_size = config["batch_size"]
+    n_exposed = 0
     for update in range(args.updates):
-        ordinary = rng.integers(0, n, size=half).tolist()
+        ordinary_size = batch_size if not needs_metric else half
+        ordinary = rng.integers(0, n, size=ordinary_size).tolist()
         rng.shuffle(ordinary)
         if metric_pool:
             physical = rng.choice(metric_pool, size=half,
@@ -501,6 +515,9 @@ def cmd_train(args, config, device):
             if needs_metric:
                 raise ValueError("empty physical selection for a metric mode")
         metric_count = len(physical)
+        n_exposed += len(ordinary) + len(physical)
+        if update == 0:
+            print(f"[train] batch_size={batch_size} ordinary={len(ordinary)} physical={len(physical)} mode={args.mode}")
         loss, parts = objective(student, batch, args.mode, config["execute_steps"],
                                 scales, metric_weight=config["metric_weight"],
                                 anchor_weight=config["anchor_weight"],
@@ -546,17 +563,22 @@ def cmd_train(args, config, device):
                       scale_stats=scale_stats, needs_metric=bool(needs_metric),
                       grad_norm_mean=float(np.mean(grad_norms)),
                       source_hashes=C.source_hashes()))
-    print("wrote student " + args.output + " mode " + args.mode)
+    print(f"wrote student {args.output} mode {args.mode} sample_exposure={n_exposed} mean_batch={n_exposed / max(args.updates, 1):.1f}")
     return dict(mode=args.mode, seed=args.seed, updates=args.updates)
 
 
 def cmd_evaluate(args, config, device):
     protocol, protocol_id = protocol_for(args, config)
+    if protocol is not None:
+        C.check_compute_against_lock("evaluate", protocol, config, device)
     adapter = build_adapter(config, device)
+    references = (protocol or {}).get("references", {}) if protocol else {}
+    eval_role = C.resolve_eval_role(args.name, args.student, references)
     student = None
     intrinsic_mode = args.name
     intrinsic_seed = args.seed
     checkpoint_hash = None
+    inference_steps = None
     if args.student:
         student, payload = load_student(args.student, config, device)
         student.eval()
@@ -564,17 +586,33 @@ def cmd_evaluate(args, config, device):
             C.verify_student_provenance(payload, protocol, config, args.student,
                                         role="final")
         else:
-            # Unlocked runs are development only: the checkpoint must be the
-            # warm start evaluated as an explicitly labeled reference.
             C.verify_student_provenance(payload, None, config, args.student,
                                         role="reference")
         intrinsic_mode = str(payload["mode"])
         intrinsic_seed = int(payload["seed"])
         checkpoint_hash = C.sha256_file(args.student)
+        if not checkpoint_hash:
+            raise C.ProtocolError("student evaluation requires a non-null checkpoint hash")
+        if args.name != intrinsic_mode:
+            raise C.ProtocolError(f"alias {args.name!r} conflicts with the checkpoint intrinsic mode {intrinsic_mode!r}; use --name {intrinsic_mode}")
+        eval_role = "student"
+        inference_steps = 2
+    else:
+        spec = references.get("teacher") if eval_role == "teacher_reference" else references.get("native_fast" if eval_role == "native_fast_reference" else "warm")
+        if protocol is not None and spec is None and eval_role in ("teacher_reference", "native_fast_reference"):
+            raise C.ProtocolError(f"{eval_role} {args.name!r} is not a declared reference in the lock; declare it with --declare-* or evaluate a student")
+        checkpoint_hash = C.sha256_file(config["checkpoint"])
+        inference_steps = int(args.steps)
     source = args.source or config["source"]
     steps = args.steps
     split = "development" if args.development else "test"
-    rng = np.random.default_rng(args.seed)
+    eval_replicate = int(getattr(args, "eval_replicate", 0))
+    if protocol is not None:
+        locked_noise = protocol.get("eval_noise") or {}
+        if int(locked_noise.get("replicate", 0)) != eval_replicate:
+            raise C.ProtocolError("--eval-replicate mismatch with the locked eval-noise schedule; regenerate the lock")
+        if args.source is not None and args.source != locked_noise.get("source", args.source):
+            raise C.ProtocolError("--source " + str(args.source) + " != locked eval source " + str(locked_noise.get("source")))
     if protocol is not None:
         if args.development:
             raise C.ProtocolError("locked evaluation is the final test run; "
@@ -607,8 +645,9 @@ def cmd_evaluate(args, config, device):
           f"warmup_episodes={warmup} clip={config['clip_actions']}")
     with open(args.output, "w") as handle:
         for episode, scene in enumerate(scenes):
-            policy_noise = np.stack([sample_source(rng, (16, 2), source)
-                                     for _ in range(max_decisions)])
+            policy_noise = np.stack([
+                sample_source(np.random.default_rng(C.eval_noise_key(eval_replicate, scene, d)), (16, 2), source)
+                for d in range(max_decisions)])
             env = adapter.new_env(image=True)
             obs, _ = adapter.reset(env, scene)
             done = False
@@ -619,6 +658,7 @@ def cmd_evaluate(args, config, device):
             raw_violations = 0
             executed_violations = 0
             coordinates = 0
+            executed_coordinates = 0
             clipped_coordinates = 0
             terminated_any = False
             truncated_any = False
@@ -643,10 +683,11 @@ def cmd_evaluate(args, config, device):
                 sync()
                 decision_latencies.append((time.perf_counter() - decision_start) * 1000.0)
                 decision += 1
-                raw_violations += prepared["raw_violations"]
-                executed_violations += prepared["executed_violations"]
-                coordinates += prepared["coordinates"]
-                clipped_coordinates += (prepared["raw_violations"]
+                generated_violations = prepared["raw_violations"]
+                generated_coordinates = prepared["coordinates"]
+                raw_violations += generated_violations
+                coordinates += generated_coordinates
+                clipped_coordinates += (generated_violations
                                         if prepared["clipped"] else 0)
                 for action in prepared["prepared"]:
                     obs, reward, terminated, truncated, done = adapter.raw_step(env, action)
@@ -654,6 +695,10 @@ def cmd_evaluate(args, config, device):
                     terminated_any = terminated_any or terminated
                     truncated_any = truncated_any or truncated
                     steps_taken += 1
+                    executed_coordinates += 1
+                    a = np.asarray(action, dtype=np.float64)
+                    if bool(((a < 0.0) | (a > 512.0)).any()):
+                        executed_violations += 1
                     if done or steps_taken >= config["episode_steps"]:
                         break
             env.close()
@@ -662,8 +707,12 @@ def cmd_evaluate(args, config, device):
             is_warmup = episode < warmup
             handle.write(json.dumps({
                 "method": intrinsic_mode, "alias": args.name,
+                "eval_role": eval_role, "eval_replicate": eval_replicate,
+                "training_seed": intrinsic_seed,
+                "evaluation_noise_key": C.eval_noise_key(eval_replicate, scene, 0),
+                "inference_steps": inference_steps,
                 "intrinsic_mode": intrinsic_mode, "intrinsic_seed": intrinsic_seed,
-                "training_seed": intrinsic_seed, "scene": scene, "split": split,
+                "scene": scene, "split": split,
                 "warmup": int(is_warmup),
                 "success": success, "terminated": int(terminated_any),
                 "truncated": int(truncated_any), "episode_cap_reached": int(capped),
@@ -676,7 +725,9 @@ def cmd_evaluate(args, config, device):
                 "action_head_latency_median_ms": (None if is_warmup else
                                                   float(np.median(head_latencies))),
                 "raw_violation_fraction": raw_violations / max(coordinates, 1),
-                "executed_violation_fraction": executed_violations / max(coordinates, 1),
+                "generated_violation_fraction": raw_violations / max(coordinates, 1),
+                "executed_violation_fraction": executed_violations / max(executed_coordinates, 1),
+                "executed_coordinates": executed_coordinates,
                 "clip_fraction": clipped_coordinates / max(coordinates, 1),
                 "coordinates": coordinates,
                 "protocol_id": protocol_id,
@@ -736,6 +787,8 @@ def main():
                        choices=["gaussian", "uniform", "uniform_symmetric"])
     entry.add_argument("--seed", type=int, default=0)
     entry.add_argument("--episodes", type=int, default=None)
+    entry.add_argument("--eval-replicate", type=int, default=0,
+                       help="evaluation noise replicate; paired arms share it")
     entry.add_argument("--development", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)

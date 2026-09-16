@@ -21,21 +21,69 @@ def load_config(path):
     return config
 
 
+DIAGNOSTIC_REQUIRED_KEYS = ("condition", "target_mid", "jacobian_start",
+                            "jacobian_end")
+
+
+def _diagnostic_metric_key(config):
+    return "metric_exact" if config.get("metric_mode", "exact") == "exact" \
+        else "probes"
+
+
+def _diagnostic_eligible(context, metric_key):
+    if not context.get("has_metric", False):
+        return False
+    return all(key in context for key in
+               DIAGNOSTIC_REQUIRED_KEYS + (metric_key,))
+
+
 def validation_rows(contexts, config, per_scene=2, max_contexts=16):
     """Diagnostic rows come exclusively from validation scenes, spread across
-    them, never the first rows of the cache."""
+    them, never the first rows of the cache.
+
+    Only metric-labelled contexts (has_metric plus every tensor the
+    diagnostic consumes) are eligible: selecting a validation context
+    without Jacobians would fail later in tensors_of with a KeyError.
+    Eligible rows spread round-robin (one per scene before any scene
+    contributes a second), and the returned values are stable indices
+    into ``contexts`` so context IDs are preserved. Insufficient
+    validation metric coverage is rejected here, before the teacher is
+    loaded.
+    """
     wanted = C.scene_range(config, "validation")
+    metric_key = _diagnostic_metric_key(config)
     by_scene = {}
     for index, context in enumerate(contexts):
         scene = int(context["scene"])
-        if scene in wanted and context.get("split") == "validation":
+        if scene in wanted and context.get("split") == "validation" and \
+                _diagnostic_eligible(context, metric_key):
             by_scene.setdefault(scene, []).append(index)
     if not by_scene:
-        raise ValueError("metric cache contains no validation contexts; collect "
-                         "the validation split before running the diagnostic")
+        raise ValueError("metric cache contains no validation contexts with "
+                         "physical metrics; run the metrics stage for the "
+                         "validation split before running the diagnostic")
+    eligible_total = sum(len(group) for group in by_scene.values())
+    planned = int(config.get("validation_metric_contexts", 0))
+    if eligible_total < planned:
+        raise ValueError(
+            f"insufficient validation metric coverage: {eligible_total} "
+            f"metric-labelled validation contexts, below the planned "
+            f"{planned}; run the metrics stage for the validation split "
+            "before running the diagnostic")
     rows = []
-    for scene in sorted(by_scene)[:max_contexts]:
-        rows.extend(by_scene[scene][:per_scene])
+    ordered = sorted(by_scene)
+    for round_index in range(per_scene):
+        for scene in ordered:
+            group = by_scene[scene]
+            if round_index < len(group) and len(rows) < max_contexts:
+                rows.append(group[round_index])
+            if len(rows) >= max_contexts:
+                break
+        if len(rows) >= max_contexts:
+            break
+    if len({int(contexts[i]["scene"]) for i in rows}) < 2 and len(ordered) >= 2:
+        raise ValueError("diagnostic rows cover fewer than 2 validation "
+                         "scenes; collect broader validation metric coverage")
     return rows[:max_contexts]
 
 
@@ -79,6 +127,8 @@ def main():
     cache_path = args.cache
     verified = C.verify_label_cache(cache_path, config, expect_mode="shared",
                                     allowed_scenes=allowed, require_metric=True)
+    outputs = [args.output] + ([args.predictions] if args.predictions else [])
+    C.reserve_outputs(outputs)
     contexts = verified["contexts"]
     rows = validation_rows(contexts, config)
     metric_mode = verified["meta"]["metric_mode"]
@@ -158,6 +208,27 @@ def main():
                     n=int(v.shape[0]))
             for k, v in stack.items()}
         report["actual_errors_used_for_physical_tests"] = True
+        summary, omitted = {}, []
+        for branch in ("mid", "end", "endpoint"):
+            vals, scenes = [], []
+            for i in rows:
+                err = actual[i][branch].reshape(-1)
+                norm = float(np.linalg.norm(err))
+                if not np.isfinite(norm):
+                    omitted.append(dict(context=i, branch=branch, reason="nonfinite"))
+                    continue
+                vals.append(norm)
+                scenes.append(int(contexts[i]["scene"]))
+            by_scene = {}
+            for value, scene in zip(vals, scenes):
+                by_scene.setdefault(str(scene), []).append(value)
+            zero_frac = float(sum(1 for v in vals if v == 0.0) / max(len(vals), 1))
+            summary[branch] = dict(n_contexts=len(vals), n_omitted=len([o for o in omitted if o["branch"] == branch]),
+                                   median_norm=(float(np.median(vals)) if vals else None),
+                                   zero_sensitivity_fraction=zero_frac,
+                                   by_scene={s: dict(median_norm=float(np.median(v)), n=len(v)) for s, v in sorted(by_scene.items())})
+        report["actual_error_summary"] = summary
+        report["actual_error_omitted"] = omitted
 
     records = []
     for index in rows:
@@ -346,15 +417,25 @@ def main():
             exact_trace = float(pullback_trace(exact).item())
             entry = {"exact_quadratic": exact_value, "exact_trace": exact_trace}
             for count in args.probe_counts:
-                probes = pullback_probes(suffix_of(context, cond), target, jac_start,
-                                         config["execute_steps"], num_probes=count)
-                value = float(pullback_quadratic(probes, error, sketch=True).item())
-                trace = float(pullback_trace(probes, sketch=True).item())
+                ratios_q, ratios_t = [], []
+                for draw in range(3):
+                    gen = torch.Generator(device=device).manual_seed(10_000 + index * 131 + count * 17 + draw)
+                    probes = pullback_probes(suffix_of(context, cond), target, jac_start,
+                                             config["execute_steps"], num_probes=count,
+                                             generator=gen)
+                    value = float(pullback_quadratic(probes, error, sketch=True).item())
+                    trace = float(pullback_trace(probes, sketch=True).item())
+                    if exact_value:
+                        ratios_q.append(value / exact_value)
+                    if exact_trace:
+                        ratios_t.append(trace / exact_trace)
+                import statistics as _stats
                 entry[str(count)] = dict(
-                    quadratic_ratio=(value / exact_value) if exact_value else None,
-                    trace_ratio=(trace / exact_trace) if exact_trace else None,
-                    matches_exact=bool(exact_value and
-                                       abs(value - exact_value) / exact_value < 1e-6))
+                    quadratic_ratio_mean=(sum(ratios_q) / len(ratios_q)) if ratios_q else None,
+                    quadratic_ratio_std=(_stats.pstdev(ratios_q)) if len(ratios_q) > 1 else 0.0,
+                    trace_ratio_mean=(sum(ratios_t) / len(ratios_t)) if ratios_t else None,
+                    trace_ratio_std=(_stats.pstdev(ratios_t)) if len(ratios_t) > 1 else 0.0,
+                    n_draws=3, sketch_seed_base=10_000 + index * 131 + count * 17)
             report["sketch_audit"][str(index)] = entry
 
     # perturbation-radius stability: eps versus eps/2 on a few contexts
@@ -381,7 +462,6 @@ def main():
         report["epsilon_stability"] = stability
 
     if args.predictions:
-        C.reserve_outputs([args.predictions])
         np.savez(args.predictions,
                  records=np.array(records, dtype=object),
                  rows=np.array(rows),
@@ -393,9 +473,10 @@ def main():
                                   else np.zeros((0, 16, 2), np.float32)))
         report["predictions_path"] = args.predictions
     report["schema_version"] = C.SCHEMA_VERSION
-    C.reserve_outputs([args.output])
     C.write_meta(args.output, report)
     C.complete_output(args.output, dict(contexts=len(rows)))
+    if args.predictions:
+        C.complete_output(args.predictions, dict(records=len(records)))
     print("wrote diagnostic " + args.output)
     return 0
 

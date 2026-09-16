@@ -9,7 +9,9 @@ import numpy as np
 SOURCE_FILES = ["core.py", "hri_adapter.py", "pilot.py", "diagnose.py",
                 "analyze.py", "sanity.py", "preflight.py", "lock_protocol.py",
                 "contract.py", "smoke.py", "run_comparison.sh", "vertical_test.sh",
+                "resume_vertical.sh", "relock_and_resume.sh",
                 "config.json"]
+RESUME_HELPERS = ["resume_vertical.sh", "relock_and_resume.sh"]
 UPSTREAM_FILES = ["external/models/unet.py", "external/models/resnet.py",
                   "external/models/pusht.py"]
 PACKAGES = ["torch", "torchvision", "numpy", "scipy", "pandas", "gym",
@@ -34,6 +36,11 @@ SCENE_RANGES = {
 CUDNN_ENV_FLAG = "EXECPB_DISABLE_CUDNN"
 
 
+def normalize_seeds(seeds):
+    """Normalize locked seeds once: ints, sorted, deduplicated check by caller."""
+    return sorted(int(s) for s in seeds)
+
+
 def cudnn_healthy(device="cuda", timeout_s=60):
     """Probe whether convolutions actually run on the requested device.
 
@@ -46,8 +53,19 @@ def cudnn_healthy(device="cuda", timeout_s=60):
     """
     import subprocess as _sp
     import sys as _sys
+    import os as _os
+    # The probe must apply the fallback flag itself: the child process
+    # inherits the flag through the environment so "fallback works" is a
+    # measured claim, not an assumption.
+    child_env = dict(_os.environ)
+    flag_set = _os.environ.get(CUDNN_ENV_FLAG, "").strip() in ("1", "true", "yes")
+    if flag_set:
+        child_env[CUDNN_ENV_FLAG] = "1"
     code = (
-        "import torch, json; "
+        "import os as _o, torch, json; "
+        "flag = _o.environ.get('EXECPB_DISABLE_CUDNN','').strip() in ('1','true','yes'); "
+        "torch.backends.cudnn.enabled = (not flag) and torch.backends.cudnn.enabled; "
+        "import torch.utils.collect_env as _ce; "
         f"device = torch.device({device!r}); "
         "x = torch.randn(1,3,32,32, device=device); "
         "w = torch.randn(8,3,3,3, device=device); "
@@ -55,25 +73,41 @@ def cudnn_healthy(device="cuda", timeout_s=60):
         "torch.cuda.synchronize() if device.type == 'cuda' else None; "
         "print('conv_ok:' + str(bool(torch.backends.cudnn.is_available() and "
         "torch.backends.cudnn.enabled))); "
-        "print('cudnn_enabled=' + str(torch.backends.cudnn.enabled))"
+        "print('cudnn_enabled=' + str(torch.backends.cudnn.enabled)); "
+        "print('flag=' + str(flag)); "
+        "print('hardware=' + (torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'))"
     )
     try:
         out = _sp.run([_sys.executable, "-c", code], capture_output=True,
-                      text=True, timeout=timeout_s)
+                      text=True, timeout=timeout_s, env=child_env)
     except Exception as error:
         return dict(healthy=False, error=f"probe failed: {error}",
-                    recommendation="rerun on a host with working cuDNN")
+                    recommendation="rerun on a host with working cuDNN",
+                    device=str(device), fallback_applied=flag_set)
     if out.returncode == 0 and "conv_ok:True" in out.stdout:
-        return dict(healthy=True, native_cudnn=True)
+        return dict(healthy=True, native_cudnn=True, device=str(device),
+                    fallback_applied=flag_set,
+                    hardware=_hardware_from_probe(out.stdout))
     if out.returncode == 0 and "conv_ok:False" in out.stdout:
         return dict(healthy=True, native_cudnn=False,
+                    device=str(device), fallback_applied=flag_set,
+                    hardware=_hardware_from_probe(out.stdout),
                     note="convolution runs with the selected fallback, not "
                          "native cuDNN; latency comparisons require identical "
                          "settings")
     tail = (out.stderr or out.stdout)[-800:]
     return dict(healthy=False, error=tail,
                 recommendation="set EXECPB_DISABLE_CUDNN=1 to run the "
-                               "experiment with cuDNN disabled")
+                               "experiment with cuDNN disabled",
+                device=str(device), fallback_applied=flag_set,
+                hardware=_hardware_from_probe(out.stdout))
+
+
+def _hardware_from_probe(stdout):
+    for line in (stdout or "").splitlines():
+        if line.startswith("hardware="):
+            return line.split("=", 1)[1].strip()
+    return "unknown"
 
 
 def cudnn_disabled():
@@ -155,9 +189,8 @@ def _hash_many(paths):
 
 def source_hashes():
     here = experiment_dir()
-    root = os.path.dirname(here)
     hashes = _hash_many([os.path.join(here, name) for name in SOURCE_FILES])
-    return {os.path.relpath(k, root): v for k, v in hashes.items()}
+    return {os.path.basename(k): v for k, v in hashes.items()}
 
 
 def upstream_hashes(repository):
@@ -202,14 +235,49 @@ def asset_hashes(config):
     return out
 
 
+EVAL_ROLES = ("student", "teacher_reference", "native_fast_reference",
+              "warm_reference")
+STUDENT_ARMS = ("uniform", "prefix", "endpoint", "pullback", "identity",
+                "scalar")
+
+
+def resolve_eval_role(name, student_path, references):
+    """Item 3: an evaluation role is derived, never trusted from --name.
+
+    student: requires --student; mode/seed come from the checkpoint, the
+    checkpoint hash must be non-null, and the alias must equal the intrinsic
+    mode. teacher/native_fast/warm references require a declared reference
+    spec and prohibit names belonging to student arms. A teacher run named
+    pullback fails here, before any rollout.
+    """
+    references = references or {}
+    if student_path is not None:
+        return "student"
+    for role in ("teacher_reference", "native_fast_reference",
+                 "warm_reference"):
+        spec = references.get(role.split("_")[0]
+                              if role != "teacher_reference" else "teacher")
+        if spec is None and role == "warm_reference":
+            spec = references.get("warm")
+        if name == role or (spec is not None and name == spec.get("method")):
+            return role
+    if name in STUDENT_ARMS:
+        raise ValueError(
+            f"teacher run named {name!r}: student-arm names require "
+            "--student; declare it as a reference or pass the checkpoint")
+    return "teacher_reference" if name == "teacher" else "warm_reference"
+
+
 def canonical_choices(config, modes=None, seeds=None, updates=None, warm=None,
                       cache=None, smoke_report=None, final_scenes=None,
-                      primary_contrast=None, compute=None):
+                      primary_contrast=None, compute=None, references=None,
+                      eval_noise=None, kind=None):
     """Every experimental choice that must be part of the canonical identifier.
 
-    The final scene list, the primary contrast, and the resolved compute
-    settings are included: changing any of them without regenerating the lock
-    changes the identifier, so stale locks cannot be reused silently.
+    The final scene list, the primary contrast, the declared references, the
+    evaluation-noise schedule, and the resolved compute settings are
+    included: changing any of them without regenerating the lock changes the
+    identifier, so stale locks cannot be reused silently.
     """
     return dict(config_sha256=combined_id(config),
                 modes=None if modes is None else sorted(modes),
@@ -220,6 +288,9 @@ def canonical_choices(config, modes=None, seeds=None, updates=None, warm=None,
                 primary_contrast=(None if primary_contrast is None
                                   else [str(primary_contrast[0]),
                                         str(primary_contrast[1])]),
+                references=references,
+                eval_noise=eval_noise,
+                experiment_kind=kind,
                 compute=compute,
                 metric_mode=config.get("metric_mode", "exact"),
                 teacher_steps=int(config.get("teacher_steps", 0)),
@@ -235,13 +306,15 @@ def canonical_choices(config, modes=None, seeds=None, updates=None, warm=None,
 
 def protocol_id(config, config_path, cache_path, warm_path, modes, seeds, updates,
                 smoke_report=None, repository=None, final_scenes=None,
-                primary_contrast=None, compute=None):
+                primary_contrast=None, compute=None, references=None,
+                eval_noise=None, kind=None):
     repository = repository or config["repository"]
     choices = canonical_choices(config, modes, seeds, updates, warm_path,
                                 cache_path, smoke_report,
                                 final_scenes=final_scenes,
                                 primary_contrast=primary_contrast,
-                                compute=compute)
+                                compute=compute, references=references,
+                                eval_noise=eval_noise, kind=kind)
     parts = dict(config=source_hashes(),
                  config_file=sha256_file(config_path),
                  cache=sha256_file(cache_path),
@@ -501,9 +574,74 @@ def verify_completed(path, role=None, protocol=None):
     if not os.path.exists(path):
         raise ValueError(f"{path} completed but the artifact is missing")
     recorded = (marker.get("detail") or {}).get("sha256")
-    if recorded and sha256_file(path) != recorded:
-        raise ValueError(f"{path} bytes differ from its completion record; "
-                         "rebuild it")
+    if not recorded:
+        raise ValueError(f"MISSING_HASH: {path} completion record carries "
+                         "no artifact hash (pre-schema artifact); rebuild it "
+                         "rather than backfilling a hash")
+    if sha256_file(path) != recorded:
+        raise ValueError(f"ARTIFACT_HASH_MISMATCH: {path} bytes differ from "
+                         "its completion record; rebuild it")
+    _verify_artifact_sidecar(path)
+    if role is not None:
+        kind = ((marker.get("detail") or {}).get("kind")
+                or _sidecar_kind(path))
+        if kind is not None and kind != role:
+            raise ValueError(f"ROLE_MISMATCH: {path} is a {kind} artifact, "
+                             f"not {role}")
+    if protocol is not None:
+        locked_id = protocol.get("protocol_id")
+        artifact_protocol = ((marker.get("detail") or {}).get("protocol_id")
+                             or _sidecar_protocol(path))
+        if locked_id and artifact_protocol and artifact_protocol != locked_id:
+            raise ValueError(f"PROTOCOL_MISMATCH: {path} belongs to protocol "
+                             f"{artifact_protocol}, not the locked "
+                             f"{locked_id}")
+    return True
+
+
+def _sidecar_path(path):
+    if path.endswith(".jsonl"):
+        return path.replace(".jsonl", ".meta.json")
+    return path + ".meta.json"
+
+
+def _sidecar_field(path, field):
+    sidecar = _sidecar_path(path)
+    if not os.path.exists(sidecar):
+        return None
+    try:
+        with open(sidecar) as handle:
+            return json.load(handle).get(field)
+    except Exception:
+        return None
+
+
+def _sidecar_kind(path):
+    return _sidecar_field(path, "kind")
+
+
+def _sidecar_protocol(path):
+    return _sidecar_field(path, "protocol_id")
+
+
+def _verify_artifact_sidecar(path):
+    sidecar = _sidecar_path(path)
+    if not os.path.exists(sidecar):
+        raise ValueError(f"SIDECAR_MISMATCH: {path} has no sidecar "
+                         f"{sidecar}; rebuild it")
+    if not path.endswith(".jsonl"):
+        return True
+    try:
+        with open(sidecar) as handle:
+            meta = json.load(handle)
+    except Exception as error:
+        raise ValueError(f"SIDECAR_MISMATCH: {sidecar} unreadable: {error}")
+    with open(path) as handle:
+        n_rows = sum(1 for line in handle if line.strip())
+    scenes = meta.get("scenes")
+    if scenes is not None and len(scenes) != n_rows:
+        raise ValueError(f"SIDECAR_MISMATCH: {sidecar} lists {len(scenes)} "
+                         f"scenes for {n_rows} rows; rebuild the evaluation")
     return True
 
 
@@ -715,7 +853,8 @@ def verify_label_cache(path_or_data, config, expect_mode=None,
     if require_metric and not metric_rows:
         raise ValueError("metric cache holds no has_metric rows; "
                          "run the metrics stage before metric training")
-    return dict(contexts=contexts, meta=meta, splits=splits,
+    return dict(contexts=contexts, meta=meta, lineage=data.get("lineage") or {},
+                splits=splits,
                 scenes=sorted({int(c["scene"]) for c in contexts}),
                 n_contexts=len(contexts), n_metric=metric_rows)
 
@@ -847,7 +986,7 @@ def verify_current_protocol(protocol, config, config_path, repository=None,
             locked = protocol.get(field)
             canon = canonical.get(field)
             norm = (sorted(locked) if isinstance(locked, list)
-                    and field in ("modes", "final_scenes") else locked)
+                    and field in ("modes", "seeds", "final_scenes") else locked)
             if canon != norm:
                 problems.append(f"lock field {field} disagrees with the canonical "
                                 "payload; regenerate the lock")
@@ -866,6 +1005,50 @@ def load_protocol(path, expect_id=None):
         raise ProtocolError(f"protocol id mismatch: {protocol.get('protocol_id')} "
                             f"!= {expect_id}")
     return protocol
+
+
+def eval_noise_key(replicate, scene, decision):
+    import hashlib
+    raw = str(int(replicate)) + "/" + str(int(scene)) + "/" + str(int(decision))
+    return int(hashlib.sha256(raw.encode()).hexdigest()[:16], 16)
+
+
+def check_compute_against_lock(stage, protocol, config, device=None):
+    locked = protocol.get("compute") or {}
+    runtime = apply_compute_env(device or config.get("device", "cuda"))
+    mismatches = []
+    for key in ("cudnn_disabled", "device", "torch_version"):
+        if locked.get(key) != runtime.get(key):
+            mismatches.append(key + ": locked " + repr(locked.get(key)) + " vs runtime " + repr(runtime.get(key)))
+    if mismatches:
+        raise ProtocolError(stage + ": compute settings differ from the lock: " + "; ".join(mismatches))
+    return runtime
+
+
+def validate_eval_row_role(row, protocol):
+    role = row.get("eval_role")
+    if role not in EVAL_ROLES:
+        raise ValueError("evaluation row lacks a valid eval_role")
+    if role == "student" and not row.get("checkpoint_sha256"):
+        raise ValueError("student evaluation row without a checkpoint hash")
+    return True
+
+
+def validate_reference_rows(rows, spec, protocol):
+    expected = {(int(s), int(spec.get("replicate", 0))) for s in spec.get("scenes", [])}
+    keys = [(int(r.get("scene")), int(r.get("eval_replicate", 0))) for r in rows]
+    if len(keys) != len(set(keys)):
+        dupes = sorted({k for k in keys if keys.count(k) > 1})
+        raise ValueError("reference duplicate episodes " + repr(dupes[:5]))
+    if set(keys) != expected:
+        raise ValueError("reference episodes differ from the declared scenes: " + repr(sorted(set(keys) ^ expected)[:5]))
+    for row in rows:
+        for field in ("source", "teacher_steps", "checkpoint_sha256"):
+            want = spec.get(field)
+            if want is not None and row.get(field) != want:
+                raise ValueError("reference row " + field + " mismatch: " + repr(row.get(field)) + " != " + repr(want))
+        validate_eval_row_role(row, protocol)
+    return True
 
 
 def verify_student_provenance(payload, protocol, config, path, role="final"):
@@ -990,7 +1173,7 @@ def require_complete(frame, protocol, method, baseline,
         observed = {(int(r[columns[0]]), int(r[columns[1]])) for r in rows}
         missing_pairs = sorted(expected_pairs - observed)
         if missing_pairs:
-            raise ValueError(f"{name}: {len(missing_pairs)} planned evaluation "
+            raise ValueError(f"MISSING_EPISODE: {name}: {len(missing_pairs)} planned evaluation "
                              f"episodes missing, e.g. {missing_pairs[:5]}")
         keys = [(str(r.get("method")), int(r[columns[0]]), int(r[columns[1]]))
                 for r in rows if str(r.get("method")) == name]

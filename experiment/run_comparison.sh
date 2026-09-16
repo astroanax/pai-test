@@ -16,13 +16,14 @@ fi
 LOCK_SMOKE="$(python -c "import json,sys;print(json.load(open(sys.argv[1]))['smoke_report'])" "${PROTOCOL}")"
 LOCK_CACHE="$(python -c "import json,sys;print(json.load(open(sys.argv[1]))['cache'])" "${PROTOCOL}")"
 LOCK_WARM="$(python -c "import json,sys;print(json.load(open(sys.argv[1]))['warm_start'])" "${PROTOCOL}")"
-python - "${LOCK_SMOKE}" "${LOCK_CACHE}" "${LOCK_WARM}" <<'PY'
-import sys
+python - "${LOCK_SMOKE}" "${LOCK_CACHE}" "${LOCK_WARM}" "${PROTOCOL}" <<'PY'
+import json, sys
 sys.path.insert(0, "experiment")
 import contract as C
-for path in sys.argv[1:]:
-    C.verify_completed(path)
-print("locked artifacts verified:", sys.argv[1:])
+protocol = json.load(open(sys.argv[4]))
+for path in sys.argv[1:4]:
+    C.verify_completed(path, protocol=protocol)
+print("locked artifacts verified:", sys.argv[1:4])
 PY
 
 if ! python - "${PROTOCOL}" <<'PY'
@@ -53,7 +54,17 @@ for seed in ${SEEDS}; do
   for mode in ${MODES}; do
     out="${RUN}/student_${mode}_seed${seed}.pt"
     if [ -f "${out}.complete.json" ]; then
-      echo "skip existing ${out}"
+      if ! python - "${out}" "${PROTOCOL}" <<'PY'
+import sys
+sys.path.insert(0, "experiment")
+import contract as C
+C.verify_completed(sys.argv[1], role="student")
+PY
+      then
+        echo "ARTIFACT_HASH_MISMATCH: refusing to reuse ${out}" >&2
+        exit 1
+      fi
+      echo "skip verified ${out}"
       continue
     fi
     if [ -f "${out}" ]; then
@@ -70,7 +81,17 @@ for seed in ${SEEDS}; do
   for mode in ${MODES}; do
     out="${RUN}/final_${mode}_seed${seed}.jsonl"
     if [ -f "${out}.complete.json" ]; then
-      echo "skip existing ${out}"
+      if ! python - "${out}" "${PROTOCOL}" <<'PY'
+import sys
+sys.path.insert(0, "experiment")
+import contract as C
+C.verify_completed(sys.argv[1])
+PY
+      then
+        echo "ARTIFACT_HASH_MISMATCH: refusing to reuse ${out}" >&2
+        exit 1
+      fi
+      echo "skip verified ${out}"
       continue
     fi
     python experiment/pilot.py --config "${CONFIG}" --protocol "${PROTOCOL}" \
