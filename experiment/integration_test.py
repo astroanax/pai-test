@@ -313,7 +313,7 @@ def step_correction_eval(config):
 
 
 def step_lock_and_analysis(tmpdir, config):
-    """Steps 8b+9: canonical lock id + seed-deletion rejection."""
+    """Steps 8b+9: canonical lock id + manifest-driven negatives."""
     from analyze import paired_summary
     design = C.canonical_design(
         config, ["gad", "augmented"], [0, 1], 10, ["gad", "augmented"],
@@ -322,25 +322,71 @@ def step_lock_and_analysis(tmpdir, config):
         {"teacher": {"method": "teacher"}}, warm=None, bank=None,
         cache=None, primary_contrast=["gad", "augmented"])
     assert C.design_id(design) == design["design_id"]
-    rows = []
-    for seed in (0, 1):
-        for case, scene in (("c0", 2), ("c1", 3)):
-            for arm in ("gad", "augmented"):
-                rows.append(dict(method="own_model", K=10, model=arm,
-                                 seed=seed, case_id=case, scene=scene,
-                                 mse=0.5 if arm == "gad" else 0.6))
-    summary = paired_summary(rows, "gad", "augmented", key="mse",
-                             expected_seeds=[0, 1])
+    manifest = {"c0": dict(scene=2, context_id="x0", target_id="t0",
+                           data_sha256="h0"),
+                "c1": dict(scene=3, context_id="x1", target_id="t1",
+                           data_sha256="h1")}
+
+    def mkrows(drop=(), rename=None, extra=False, swap=False):
+        rows = []
+        for seed in (0, 1):
+            for case, scene in (("c0", 2), ("c1", 3)):
+                if (seed, case) in drop:
+                    continue
+                for arm in ("gad", "augmented"):
+                    cid = rename.get(case, case) if rename else case
+                    rows.append(dict(
+                        method="own_model", K=10, model=arm, seed=seed,
+                        case_id=cid, scene=scene,
+                        case_data_sha256=(
+                            "tampered" if swap and (seed, case) == (0, "c0")
+                            else manifest[case]["data_sha256"]),
+                        mse=0.5 if arm == "gad" else 0.6))
+        if extra:
+            rows.append(dict(method="own_model", K=10, model="gad",
+                             seed=0, case_id="cX", scene=9,
+                             case_data_sha256="hX", mse=0.1))
+        return rows
+
+    base = dict(expected_seeds=[0, 1], expected_cases=manifest)
+    summary = paired_summary(mkrows(), "gad", "augmented", key="mse",
+                             **base)
     assert summary["scenes"] >= 1
-    pruned = [r for r in rows if r["seed"] != 1]
+
+    def expect(rows, fragment, label):
+        try:
+            paired_summary(rows, "gad", "augmented", key="mse", **base)
+        except ValueError as error:
+            if isinstance(fragment, tuple):
+                assert any(f in str(error) for f in fragment),                     (label, str(error))
+            else:
+                assert fragment in str(error), (label, str(error))
+        else:
+            raise AssertionError(label + " accepted")
+
+    # Whole-case deletion across all arms/seeds (also deletes scene 3).
+    expect([r for r in mkrows() if r["case_id"] != "c1"],
+           "MISSING_EPISODE", "deleted case")
+    # Whole-seed deletion.
+    expect([r for r in mkrows() if r["seed"] != 1],
+           "MISSING_EPISODE", "deleted seed")
+    # Rename, unexpected case, swapped target under retained ID. A
+    # rename is both missing-planned and unexpected-observed; either
+    # rejection is correct.
+    expect(mkrows(rename={"c1": "c1x"}),
+           ("MISSING_EPISODE", "unexpected"), "renamed case")
+    expect(mkrows(extra=True), "unexpected", "extra case")
+    expect(mkrows(swap=True), "divorced", "swapped target")
+    # Manifest is mandatory, never inferred.
     try:
-        paired_summary(pruned, "gad", "augmented", key="mse",
+        paired_summary(mkrows(), "gad", "augmented", key="mse",
                        expected_seeds=[0, 1])
     except ValueError as error:
-        assert "MISSING_EPISODE" in str(error), str(error)
+        assert "locked eval manifest" in str(error), str(error)
     else:
-        raise AssertionError("deleted seed accepted")
-    print("8b+9. lock id recomputes; deleted seed -> MISSING_EPISODE")
+        raise AssertionError("manifest-less analysis accepted")
+    print("8b+9. lock id recomputes; case/seed/rename/extra/swap "
+          "negatives all reject")
 
 
 def main():
@@ -359,7 +405,9 @@ def main():
     step_inversion()
     step_correction_eval(config)
     step_lock_and_analysis(tmpdir, config)
-    print("integration_test: ALL STEPS PASS")
+    from integration_command_path import run_command_path
+    run_command_path()
+    print("integration_test: ALL STEPS PASS (unit + command path)")
 
 
 if __name__ == "__main__":

@@ -32,11 +32,15 @@ NONINF_MARGIN = 0.05
 def paired_summary(frame, method, baseline, key="mse", repeats=BOOTSTRAP_REPEATS,
                    method_column="own_model", expected_seeds=None,
                    expected_cases=None):
-    # Audit fdb59ff item 11: completeness comes from a planned manifest
-    # (seeds x cases), never from observed keys alone: deleting both
-    # arms of an entire seed or case is detected. Paired rows must
-    # share target/context identity (scene equality); duplicates,
-    # missing, and extra tuples are all errors.
+    """Expected tuples come from the LOCKED eval manifest, never from
+    observed rows (audit 1344ed0 item 4).
+
+    expected_cases: {case_id: {scene, context_id, target_id,
+    data_sha256}}. expected_seeds: locked seed list. Missing, extra,
+    and duplicate tuples are errors in both directions; paired rows
+    must share scene AND data identity (a swapped target under a
+    retained ID changes data_sha256 and is rejected).
+    """
     sel = [r for r in frame
            if r.get("method") == method_column and r.get("K") == PRIMARY_K
            and r.get("model") in (method, baseline)]
@@ -47,30 +51,51 @@ def paired_summary(frame, method, baseline, key="mse", repeats=BOOTSTRAP_REPEATS
             raise ValueError(f"duplicate correction tuple {key_tuple}; "
                              "never deduplicate by overwriting")
         index[key_tuple] = row
-    observed_cases = sorted({case for (_, case, _) in index})
-    observed_seeds = sorted({seed for (seed, _, _) in index})
-    seeds = list(expected_seeds) if expected_seeds is not None else observed_seeds
-    cases = list(expected_cases) if expected_cases is not None else observed_cases
-    if not seeds or not cases:
+    if expected_cases is None or expected_seeds is None:
+        raise ValueError(
+            "paired_summary needs the locked eval manifest (expected_cases "
+            "dict + expected_seeds); observed-key completeness cannot see "
+            "a deleted case or seed")
+    seeds = [int(s) for s in expected_seeds]
+    manifest = dict(expected_cases)
+    if not seeds or not manifest:
         raise ValueError("incomplete paired evaluations: empty manifest")
     extra = [(s, c, t) for (s, c, t) in index
-             if s not in seeds or c not in cases]
+             if int(s) not in seeds or str(c) not in manifest]
     if extra:
         raise ValueError(f"unexpected correction tuples {extra[:5]}; "
-                         "plan manifest mismatch")
-    missing = [(s, c, t) for s in seeds for c in cases
-               for t in (method, baseline) if (s, c, t) not in index]
+                         "plan manifest mismatch (renamed/added case?)")
+    # Normalized keys: int seeds, str case_ids (JSON round-trips turn
+    # int-like IDs into strings; int(s) on a non-numeric seed raises).
+    index_norm = {(int(s), str(c), t): row
+                  for (s, c, t), row in index.items()}
+    missing = [(s, c, t) for s in seeds for c in manifest
+               for t in (method, baseline)
+               if (s, str(c), t) not in index_norm]
     if missing:
         raise ValueError(f"MISSING_EPISODE: {len(missing)} planned "
                          f"(seed, case, arm) tuples missing, first {missing[:5]}")
-    keys = {(s, c) for s in seeds for c in cases}
+    keys = [(s, str(c)) for s in seeds for c in manifest]
     by_scene = {}
     for (seed, case) in keys:
-        a_row, b_row = index[(seed, case, method)], index[(seed, case, baseline)]
-        if a_row.get("scene") != b_row.get("scene"):
-            raise ValueError(
-                f"paired rows differ in context: {(seed, case)} "
-                f"{a_row.get('scene')} != {b_row.get('scene')}")
+        a_row = index_norm[(seed, case, method)]
+        b_row = index_norm[(seed, case, baseline)]
+        want = manifest[case]
+        for row, tag in ((a_row, method), (b_row, baseline)):
+            if int(row.get("scene", -1)) != int(want["scene"]):
+                raise ValueError(
+                    f"paired row scene != manifest for {(seed, case, tag)}: "
+                    f"{row.get('scene')} != {want['scene']}")
+            got_hash = row.get("case_data_sha256")
+            if got_hash is None:
+                raise ValueError(
+                    f"paired row lacks case_data_sha256 for "
+                    f"{(seed, case, tag)}; cannot verify target identity")
+            if str(got_hash) != str(want["data_sha256"]):
+                raise ValueError(
+                    f"paired row data divorced from manifest for "
+                    f"{(seed, case, tag)}: target/condition swapped "
+                    "under a retained ID?")
         a, b = a_row[key], b_row[key]
         scene = a_row.get("scene")
         by_scene.setdefault(scene, []).append(a - b)
@@ -82,8 +107,8 @@ def paired_summary(frame, method, baseline, key="mse", repeats=BOOTSTRAP_REPEATS
     boot = scene_means[draws].mean(axis=1)
     per_seed = []
     for seed in sorted({s for (s, _) in keys}):
-        vals = np.array([index[(s, c, method)][key]
-                         - index[(s, c, baseline)][key]
+        vals = np.array([index_norm[(s, c, method)][key]
+                         - index_norm[(s, c, baseline)][key]
                          for (s, c) in keys if s == seed])
         per_seed.append(dict(seed=int(seed), n=int(len(vals)),
                              difference=float(np.mean(vals))))
@@ -97,10 +122,12 @@ def paired_summary(frame, method, baseline, key="mse", repeats=BOOTSTRAP_REPEATS
 
 
 def discordant_pairs(rows, method, baseline):
-    # Audit fdb59ff item 11: correction rows (K == PRIMARY_K) and
-    # ordinary episode logs (no K key) share one schema-agnostic path;
-    # episode identity includes the eval replicate; duplicates are
-    # errors, never silent overwrites.
+    # Audit 1344ed0 item 5: the exact test runs PER training seed
+    # (repeated observations of one scene across fixed checkpoints are
+    # dependent). The combined count is reported as pooled-descriptive
+    # only, never as an independent-pair exact result. The combined
+    # effect uses the scene-clustered bootstrap in
+    # noninferiority_from_episodes.
     from scipy.stats import binomtest
     index = {}
     for row in rows:
@@ -115,18 +142,41 @@ def discordant_pairs(rows, method, baseline):
                row.get("eval_replicate", 0))
         if tag in index.get(key, {}):
             raise ValueError(f"duplicate success tuple {key + (tag,)}")
-        index.setdefault(key, {})[tag] = row["success"]
+        index.setdefault(key, {})[tag] = int(row["success"])
+    by_seed = {}
+    for (seed, _scene, _rep), pair in index.items():
+        by_seed.setdefault(seed, []).append(pair)
+    per_seed = []
+    for seed in sorted(by_seed):
+        wins = sum(1 for v in by_seed[seed]
+                   if v.get(method) == 1 and v.get(baseline) == 0)
+        losses = sum(1 for v in by_seed[seed]
+                     if v.get(method) == 0 and v.get(baseline) == 1)
+        test = (binomtest(min(wins, losses), wins + losses, 0.5)
+                if (wins + losses) else None)
+        per_seed.append(dict(
+            seed=int(seed), wins=wins, losses=losses,
+            n_pairs=len(by_seed[seed]),
+            p_two_sided=None if test is None else float(test.pvalue)))
     wins = sum(1 for v in index.values()
                if v.get(method) == 1 and v.get(baseline) == 0)
     losses = sum(1 for v in index.values()
                  if v.get(method) == 0 and v.get(baseline) == 1)
-    test = binomtest(min(wins, losses), wins + losses, 0.5) if (wins + losses) else None
     return dict(wins=wins, losses=losses, n_pairs=len(index),
-                p_two_sided=None if test is None else float(test.pvalue))
+                per_seed=per_seed,
+                note=("pooled across training seeds and repeated scenes; "
+                      "descriptive only, not an independent-pair exact "
+                      "test; see per_seed exact tests and the "
+                      "scene-clustered bootstrap"))
 
 
 def noninferiority_from_episodes(rows, method, baseline,
-                                 margin=NONINF_MARGIN, repeats=BOOTSTRAP_REPEATS):
+                                 margin=NONINF_MARGIN, repeats=BOOTSTRAP_REPEATS,
+                                 expected=None):
+    """expected (audit 1344ed0 item 5): dict(seeds=[...], scenes=[...],
+    replicates=[...]) — exactly the planned episode grid. Missing,
+    extra, and duplicate episode tuples are errors in both directions;
+    the bootstrap resamples scenes jointly."""
     """Item 19: unassisted success on COMPLETE episode pairs, never inferred
     from correction-MSE rows. Paired (method - baseline) success per
     (seed, scene); noninferior if the bootstrap CI lower bound exceeds
@@ -151,6 +201,24 @@ def noninferiority_from_episodes(rows, method, baseline,
     if missing:
         raise ValueError(f"MISSING_EPISODE: {len(missing)} episode pairs "
                          f"lack an arm, first {missing[:5]}")
+    if expected is not None:
+        exp = {(int(s), int(c), int(r), t)
+               for s in expected.get("seeds", [])
+               for c in expected.get("scenes", [])
+               for r in expected.get("replicates", [])
+               for t in (method, baseline)}
+        got = {(int(s), int(c), int(r), t)
+               for (s, c, r) in keys for t in (method, baseline)
+               if t in index[(s, c, r)]}
+        extra = sorted(got - exp)
+        if extra:
+            raise ValueError(f"unexpected episode tuples {extra[:5]}; "
+                             "plan grid mismatch")
+        absent = sorted(exp - got)
+        if absent:
+            raise ValueError(
+                f"MISSING_EPISODE: {len(absent)} planned episode tuples "
+                f"missing, first {absent[:5]}")
     if not keys:
         return dict(n=0, margin=margin, noninferior=None,
                     note="no complete episode pairs supplied")
@@ -210,19 +278,26 @@ def main():
     for row in rows:
         if "success" in row:
             C.check_binary_success(row["success"])
-    # Seeds come from the locked manifest (a deleted planned seed is
-    # MISSING_EPISODE, not silently absent); case_ids come from the
-    # observed union across surviving seeds, so a seed deletion still
-    # leaves its cases expected.
+    # Seeds AND cases come from the locked eval manifest (a deleted
+    # planned seed or a deleted/renamed/added case is an error, never
+    # silently absorbed); paired rows must also match manifest scene +
+    # data identity.
+    design = protocol.get("design", {})
     summary = paired_summary(
         rows, args.method, args.baseline,
-        expected_seeds=(protocol.get("design", {}).get("seeds") or None))
+        expected_seeds=(design.get("seeds") or None),
+        expected_cases=(design.get("eval_cases") or None))
     summary.update(protocol_id=protocol.get("protocol_id"),
                    primary_K=PRIMARY_K,
                    discordant=discordant_pairs(rows, args.method,
                                                args.baseline),
                    noninferiority=noninferiority_from_episodes(
-                       rows, args.method, args.baseline),
+                       rows, args.method, args.baseline,
+                       expected=dict(
+                           seeds=design.get("seeds", []),
+                           scenes=(design.get("scenes", {}).get("final", [])),
+                           replicates=design.get("eval_replicates",
+                                                 [0]))),
                    noninferiority_margin_pp=NONINF_MARGIN * 100,
                    manifest=protocol.get("design_sha256"),
                    source_hashes=source_hashes(),

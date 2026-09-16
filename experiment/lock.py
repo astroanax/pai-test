@@ -32,6 +32,25 @@ def main():
     parser.add_argument("--base-report", required=True,
                         help="development evaluation file (jsonl) of the "
                              "augmented base student for the 0.30 floor")
+    parser.add_argument("--base-checkpoint", required=True,
+                        help="the base (augmented) student checkpoint the "
+                             "base report evaluates: rows are compared "
+                             "against THIS hash, never the teacher "
+                             "checkpoint (audit 1344ed0 item 1)")
+    parser.add_argument("--eval-cases", required=True,
+                        help="evaluation-case manifest file (jsonl): locks "
+                             "planned case IDs + scene/context/target "
+                             "identity for analysis completeness "
+                             "(audit 1344ed0 item 4)")
+    parser.add_argument("--lr-selection", required=True,
+                        help="completed lr-selection artifact from a "
+                             "tune-only correction run: hash and settings "
+                             "are locked, final runs consume it without "
+                             "retuning (audit 1344ed0 item 6)")
+    parser.add_argument("--eval-replicates", nargs="*", type=int,
+                        default=None,
+                        help="planned unassisted-evaluation replicates "
+                             "(default [0])")
     parser.add_argument("--warm", required=True)
     parser.add_argument("--bank", required=True)
     parser.add_argument("--history", required=True,
@@ -66,6 +85,14 @@ def main():
         readiness = json.load(handle)
     if not readiness.get("passed"):
         raise ValueError("readiness report is not a pass; fix the base stack")
+    # Audit 1344ed0 item 7: score-only (diagnostic_pilot) acceptance
+    # never authorizes the principal success-rate experiment.
+    if readiness.get("acceptance_mode",
+                     readiness.get("gate", {}).get("acceptance_mode")) != "principal":
+        raise ValueError(
+            "readiness acceptance is not principal "
+            f"({readiness.get('acceptance_mode')}); a score-only pass "
+            "authorizes a diagnostic pilot, not the principal lock")
     if readiness.get("source_hashes") != C.source_hashes():
         raise ValueError("readiness report came from different sources; rerun")
     if readiness.get("config_sha256") != C.sha256_file(args.config):
@@ -104,12 +131,30 @@ def main():
         raise ValueError(
             "base report does not cover the complete development set: "
             f"{sorted({int(r.get('scene', -1)) for r in aug_rows})[:5]}")
+    # Audit 1344ed0 item 1: the base gate assesses the BASE student
+    # checkpoint, whose hash the report rows must carry. Comparing
+    # against the teacher checkpoint rejects every legitimate
+    # base-student report.
+    C.verify_completed(args.base_checkpoint)
+    import torch as _torch_base
+    base_payload = _torch_base.load(args.base_checkpoint, map_location="cpu",
+                                    weights_only=True)
+    if base_payload.get("arm") != "augmented":
+        raise ValueError(
+            f"base checkpoint arm is {base_payload.get('arm')!r}; the base "
+            "gate assesses the augmented base student")
+    base_hash = C.sha256_file(args.base_checkpoint)
     for row in aug_rows:
-        if row.get("checkpoint_sha256") != C.sha256_file(
-                config["checkpoint"]):
+        if row.get("checkpoint_sha256") != base_hash:
             raise ValueError(
-                "base report checkpoint differs from the locked assets; "
-                "rebuild the evaluation")
+                "base report row checkpoint differs from --base-checkpoint; "
+                "the report must evaluate the checkpoint being gated, "
+                "not the teacher or another student")
+        if int(row.get("seed", row.get("training_seed", -1))) != int(
+                base_payload.get("seed", -999)):
+            raise ValueError(
+                "base report row seed differs from the base checkpoint "
+                "seed; refusing a mixed-seed base gate")
     aug = sum(int(r.get("success", 0)) for r in aug_rows) / len(aug_rows)
     if float(aug) < MIN_AUGMENTED_DEV_SUCCESS:
         raise ValueError(
@@ -136,6 +181,68 @@ def main():
         raise ValueError(
             "pair-bank lineage/member mismatch: "
             f"{len(member_keys)} member keys vs {len(record_keys)} records")
+    # Audit 1344ed0 item 6: the lr selection is a completed,
+    # hash-locked artifact. Its tune scenes must be disjoint from the
+    # evaluation scenes (checked by scene AND context, not split
+    # strings alone).
+    C.verify_completed(args.lr_selection)
+    with open(args.lr_selection) as handle:
+        lr_sel = json.load(handle)
+    if lr_sel.get("kind") != "lr_selection":
+        raise ValueError("lr-selection artifact has wrong kind")
+    locked_lr = float(lr_sel["lr"])
+    lr_tune_scenes = {int(s) for s in lr_sel.get("tune_scenes", [])}
+    lr_tune_contexts = {str(c) for c in lr_sel.get("tune_contexts", [])}
+    # Audit 1344ed0 item 4: lock the evaluation-case manifest. Every
+    # planned case_id maps to its scene/context/target identity plus a
+    # data fingerprint; analysis derives expected tuples from here,
+    # never from observed rows.
+    # NOTE: the eval-cases file is a hand-written input manifest, not
+    # a pipeline artifact, so it carries no completion sidecar; its
+    # sha256 is recorded in the design instead.
+    eval_cases_sha256 = C.sha256_file(args.eval_cases)
+    eval_manifest = {}
+    with open(args.eval_cases) as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            raw = json.loads(line)
+            if raw.get("unreachable"):
+                continue
+            for key in ("case_id", "context_id", "target_id", "scene",
+                        "q0", "target", "condition"):
+                if key not in raw:
+                    raise ValueError(
+                        f"eval manifest case missing {key}: "
+                        f"{raw.get('case_id')}")
+            case_id = str(raw["case_id"])
+            q0, target, cond = C.normalize_case_arrays(
+                raw["q0"], raw["target"], raw["condition"], case_id)
+            entry = dict(scene=int(raw["scene"]),
+                         context_id=str(raw["context_id"]),
+                         target_id=str(raw["target_id"]),
+                         data_sha256=C.case_data_sha256(q0, target, cond))
+            if case_id in eval_manifest and eval_manifest[case_id] != entry:
+                raise ValueError(
+                    f"eval manifest case_id {case_id} maps to two "
+                    "different identities; case IDs must be unique")
+            eval_manifest[case_id] = entry
+    if not eval_manifest:
+        raise ValueError("eval manifest holds no reachable cases")
+    eval_scenes = {e["scene"] for e in eval_manifest.values()}
+    eval_contexts = {e["context_id"] for e in eval_manifest.values()}
+    if lr_tune_scenes & eval_scenes:
+        raise ValueError(
+            "tune/eval scene overlap: "
+            f"{sorted(lr_tune_scenes & eval_scenes)[:5]}; tune and "
+            "evaluation must be disjoint by scene")
+    if lr_tune_contexts & eval_contexts:
+        raise ValueError(
+            "tune/eval context overlap: "
+            f"{sorted(lr_tune_contexts & eval_contexts)[:5]}")
+    eval_replicates = sorted(int(r) for r in (
+        args.eval_replicates if args.eval_replicates else [0]))
     import torch as _torch_lock
     warm_payload = _torch_lock.load(args.warm, map_location="cpu",
                                     weights_only=True)
@@ -191,6 +298,21 @@ def main():
         warm=args.warm, bank=args.bank, cache=args.history,
         primary_contrast=PRIMARY_CONTRAST)
     design["teacher_history_sha256"] = teacher_hash
+    # Audit 1344ed0 item 2: the warm init seed has its own design
+    # field, checked by the init role; final seeds are checked
+    # separately and never conflated with it.
+    design["warm_seed"] = int(warm_payload.get("seed", -1))
+    design["base_checkpoint_sha256"] = base_hash
+    design["base_checkpoint"] = dict(arm=base_payload.get("arm"),
+                                     seed=int(base_payload.get("seed", -1)))
+    design["lr_selection"] = dict(sha256=C.sha256_file(args.lr_selection),
+                                  lr=locked_lr,
+                                  tune_scenes=sorted(lr_tune_scenes),
+                                  tune_contexts=sorted(lr_tune_contexts))
+    design["eval_cases"] = {k: eval_manifest[k]
+                            for k in sorted(eval_manifest)}
+    design["eval_cases_sha256"] = eval_cases_sha256
+    design["eval_replicates"] = list(eval_replicates)
     design["design_id"] = C.design_id(design)
     protocol = dict(
         protocol_id=C.design_id(design), design=design,
@@ -200,6 +322,8 @@ def main():
         artifacts={"warm": args.warm, "bank": args.bank,
                    "history": args.history,
                    "teacher_history": args.teacher_history,
+                   "base_checkpoint": args.base_checkpoint,
+                   "lr_selection": args.lr_selection,
                    "readiness_report": args.readiness_report},
         readiness_report=args.readiness_report,
         experiment_kind=args.kind, final_prefix=args.final_prefix,

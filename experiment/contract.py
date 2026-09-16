@@ -265,26 +265,41 @@ def is_complete(path):
 def verify_completed(path, role=None, protocol=None):
     """Verify a completed artifact against its sidecar.
 
-    Error codes: MISSING_HASH (no sidecar where required), ARTIFACT_HASH_MISMATCH,
-    SIDECAR_MISMATCH (size drift), ROLE_MISMATCH, PROTOCOL_MISMATCH.
+    Two concerns, checked in order, for EVERY artifact type including
+    self-describing JSON (audit 1344ed0 item 3: "self-describing" never
+    implied exemption, so a JSON without a marker, with edited bytes,
+    or with a failure marker was wrongly accepted):
+    1. byte integrity and completion: no active failure marker,
+       completion sidecar present, recorded hash and byte count match;
+    2. semantic validity (schema/provenance) is the caller's job.
+    Error codes: FAILED (failure marker present), MISSING_HASH (no
+    sidecar), ARTIFACT_HASH_MISMATCH, SIDECAR_MISMATCH (size drift),
+    ROLE_MISMATCH, PROTOCOL_MISMATCH.
     """
     sidecar_path = path + COMPLETION_SUFFIX
     if not os.path.exists(path):
         raise ProtocolError(f"MISSING_HASH: artifact absent: {path}")
-    if _is_self_describing(path):
-        return {"path": path, "self_describing": True,
-                "sha256": sha256_file(path)}
-    if not _needs_sidecar(path):
-        return {"path": path, "sha256": sha256_file(path)}
-    if not os.path.exists(sidecar_path):
-        raise ProtocolError(f"MISSING_HASH: no completion sidecar for {path}")
-    with open(sidecar_path) as handle:
-        sidecar = json.load(handle)
-    actual_hash = sha256_file(path)
-    if sidecar.get("sha256") != actual_hash:
-        raise ProtocolError(f"ARTIFACT_HASH_MISMATCH: {path}")
-    if int(sidecar.get("bytes", -1)) != int(os.path.getsize(path)):
-        raise ProtocolError(f"SIDECAR_MISMATCH: byte count drift for {path}")
+    if os.path.exists(path + INCOMPLETE_SUFFIX):
+        try:
+            with open(path + INCOMPLETE_SUFFIX) as handle:
+                reason = json.load(handle).get("reason", "unknown")
+        except Exception:
+            reason = "unreadable"
+        raise ProtocolError(f"FAILED: artifact has a failure marker: {path} "
+                            f"({reason})")
+    if _needs_sidecar(path) or _is_self_describing(path):
+        if not os.path.exists(sidecar_path):
+            raise ProtocolError(
+                f"MISSING_HASH: no completion sidecar for {path}")
+        with open(sidecar_path) as handle:
+            sidecar = json.load(handle)
+        actual_hash = sha256_file(path)
+        if sidecar.get("sha256") != actual_hash:
+            raise ProtocolError(f"ARTIFACT_HASH_MISMATCH: {path}")
+        if int(sidecar.get("bytes", -1)) != int(os.path.getsize(path)):
+            raise ProtocolError(f"SIDECAR_MISMATCH: byte count drift for {path}")
+    else:
+        sidecar = {"path": path, "sha256": sha256_file(path)}
     if role is not None and sidecar.get("role") != role:
         raise ProtocolError(f"ROLE_MISMATCH: expected {role!r}, sidecar has "
                             f"{sidecar.get('role')!r} for {path}")
@@ -473,6 +488,55 @@ def write_history_cache(path, contexts, config, repository=None):
                "histories": serial}
     _atomic_json(path, payload)
     return payload
+
+
+def normalize_case_arrays(q0, target, condition, case_id):
+    """Normalize correction-case arrays to q0 [1,16,2], target [1,P,2]
+    with 0 < P <= 16, condition [1,514]. Accepts unbatched or batched
+    inputs. Shared by the correction loader and the lock's eval-case
+    manifest builder so both compute identical fingerprints."""
+    import numpy as _np
+    q0 = _np.asarray(q0, dtype=_np.float64)
+    if q0.shape == (16, 2):
+        q0 = q0.reshape(1, 16, 2)
+    if q0.shape != (1, 16, 2):
+        raise ProtocolError(
+            f"case {case_id}: q0 must be [16,2] or [1,16,2]; got {q0.shape}")
+    target = _np.asarray(target, dtype=_np.float64)
+    if target.ndim == 2 and target.shape[1] == 2 \
+            and 0 < target.shape[0] <= 16:
+        target = target.reshape(1, target.shape[0], 2)
+    if not (target.ndim == 3 and target.shape[0] == 1
+            and target.shape[2] == 2 and 0 < target.shape[1] <= 16):
+        raise ProtocolError(
+            f"case {case_id}: target must be [P,2] or [1,P,2] with "
+            f"0 < P <= 16; got {target.shape}")
+    condition = _np.asarray(condition, dtype=_np.float64)
+    if condition.shape == (514,):
+        condition = condition.reshape(1, 514)
+    if condition.shape != (1, 514):
+        raise ProtocolError(
+            f"case {case_id}: condition must be [514] or [1,514]; "
+            f"got {condition.shape}")
+    for name, arr in (("q0", q0), ("target", target),
+                      ("condition", condition)):
+        if not _np.isfinite(arr).all():
+            raise ProtocolError(f"case {case_id}: nonfinite {name}")
+    return q0, target, condition
+
+
+def case_data_sha256(q0_np, target_np, cond_np):
+    """Immutable data fingerprint of a correction case: shapes plus raw
+    bytes of (q0, target, condition). A swapped target or conditioning
+    vector under a retained ID changes this hash (audit 1344ed0
+    item 4)."""
+    import numpy as _np
+    digest = hashlib.sha256()
+    for arr in (q0_np, target_np, cond_np):
+        arr = _np.ascontiguousarray(_np.asarray(arr, dtype=_np.float64))
+        digest.update(str(arr.shape).encode())
+        digest.update(arr.tobytes())
+    return digest.hexdigest()
 
 
 def _as_float_array(value, name):
@@ -705,7 +769,11 @@ def verify_student_provenance(payload, protocol, config, path,
         if design.get("arms") and payload.get("arm") not in design["arms"] \
                 and payload.get("arm") != "warm":
             problems.append(f"checkpoint arm {payload.get('arm')!r} is not locked")
-        if design.get("seeds") and int(payload.get("seed", -1)) not in \
+        # Audit 1344ed0 item 2: the locked-seed list governs FINAL
+        # fine-tuning seeds only. The warm init seed is checked
+        # against warm_seed in the init role below, never here.
+        if role == "final" and design.get("seeds") and int(
+                payload.get("seed", -1)) not in \
                 [int(s) for s in design["seeds"]]:
             problems.append("checkpoint seed is not a locked seed")
         # Item 22: history cache, pair bank, and init hashes are
@@ -722,9 +790,27 @@ def verify_student_provenance(payload, protocol, config, path,
             problems.append("init role requires the lock holding warm_sha256")
         elif sha256_file(path) != design.get("warm_sha256", "absent"):
             problems.append("init file hash != locked warm_sha256")
-        elif payload.get("history_sha256") not in \
-                (None, design.get("cache_sha256", "absent")):
-            problems.append("warm history differs from the locked history")
+        else:
+            # Audit 1344ed0 item 2: the warm checkpoint was trained on
+            # the TEACHER history cache, not the warm-student history
+            # cache (design cache_sha256). Comparing against the wrong
+            # hash accepts a warm start trained on the wrong data.
+            expected_teacher = design.get(
+                "teacher_history_sha256",
+                design.get("cache_sha256", "absent"))
+            if payload.get("history_sha256") not in \
+                    (None, expected_teacher):
+                problems.append(
+                    "warm checkpoint history differs from the locked "
+                    "teacher history")
+            # The warm init seed lives in its own design field, never
+            # conflated with the allowed final fine-tuning seeds.
+            warm_seed = design.get("warm_seed")
+            if warm_seed is not None and int(payload.get("seed", -1)) != int(
+                    warm_seed):
+                problems.append(
+                    f"warm init seed {payload.get('seed')} != locked "
+                    f"warm_seed {warm_seed}")
     if role == "final":
         if payload.get("protocol_id") is None and protocol is not None:
             problems.append("unlocked checkpoint cannot serve as final student")
@@ -757,21 +843,30 @@ READINESS_MIN_SCORE = 0.65
 
 
 def readiness_gate(conventions, source, steps):
-    """Item 24: ONE shared gate over the predeclared replicate set.
+    """ONE shared acceptance definition over the predeclared replicate set.
 
-    Aggregates all replicate rows of the (source, steps) convention and
-    passes on mean success >= 0.50 or mean score >= 0.65. Both the
-    readiness report and the lock call this function, so the criterion
-    cannot drift between them.
+    Aggregates all replicate rows of the (source, steps) convention.
+    Audit 1344ed0 item 7: success>=0.50 authorizes the principal
+    success-rate experiment ("principal"); score>=0.65 alone authorizes
+    only a diagnostic pilot ("diagnostic_pilot"), never the principal
+    experiment. Both the readiness report and the lock call this
+    function, so the criterion cannot drift between them.
     """
     rows = [c for c in (conventions or [])
             if c.get("source") == source and int(c.get("steps", -1)) == int(steps)]
     if not rows:
-        return dict(passed=False, reason="no rows for the convention")
+        return dict(passed=False, mode="fail",
+                    reason="no rows for the convention")
     success = float(sum(r.get("success", 0.0) for r in rows) / len(rows))
     score = float(sum(r.get("score", 0.0) for r in rows) / len(rows))
-    passed = success >= READINESS_MIN_SUCCESS or score >= READINESS_MIN_SCORE
-    return dict(passed=passed, success=success, score=score, n=len(rows),
+    if success >= READINESS_MIN_SUCCESS:
+        mode = "principal"
+    elif score >= READINESS_MIN_SCORE:
+        mode = "diagnostic_pilot"
+    else:
+        mode = "fail"
+    return dict(passed=mode == "principal", mode=mode, success=success,
+                score=score, n=len(rows),
                 min_success=READINESS_MIN_SUCCESS,
                 min_score=READINESS_MIN_SCORE)
 

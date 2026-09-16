@@ -195,7 +195,8 @@ def correct_case(case, models, teacher_outs, lr, shared_offsets, device,
                 target_origin=case["target_origin"],
                 scene=case["scene"], seed=case["seed"],
                 model=case["model"], lr=lr, gamma=gamma, trust_r=trust_r,
-                protocol_id=protocol_id)
+                protocol_id=protocol_id,
+                case_data_sha256=case.get("data_sha256"))
     err0, act0 = model_prefix_mse(model, case["q0_np"], cond_t, target_np,
                                   device)
     # Audit fdb59ff item 12: one budget list everywhere. Configured
@@ -237,6 +238,11 @@ def correct_case(case, models, teacher_outs, lr, shared_offsets, device,
             model, transferred, cond_t, target_np, device)
         sync()
         transfer_latency = (time.perf_counter() - _t0) * 1000.0
+        # Audit 1344ed0 item 6: three costs stay separate. The
+        # transfer row reports the STUDENT operation (one forward to
+        # score the transferred latent + its measured latency); the
+        # teacher-edit preparation cost rides along as informational
+        # fields, never as the row's own forward count.
         rows.append(dict(row_base, method="teacher_transfer",
                          mse=transfer_mse,
                          displacement=float(
@@ -245,8 +251,12 @@ def correct_case(case, models, teacher_outs, lr, shared_offsets, device,
                          displacement_kind="latent_rms",
                          invalid=invalid_action_count(
                              transfer_act[:, :target_np.shape[1]], stats),
-                         forwards=int(t_out["forward_calls"]) + 1,
-                         backwards=0, latency_ms=transfer_latency))
+                         forwards=1,
+                         backwards=0, latency_ms=transfer_latency,
+                         teacher_edit_forwards=int(
+                             t_out["forward_calls"]),
+                         teacher_edit_backwards=int(
+                             t_out["backward_calls"])))
         best_mse, best_disp, best_invalid = err0, 0.0, rows[-3]["invalid"]
         sync()
         _r0 = time.perf_counter()
@@ -295,9 +305,16 @@ def main():
                         help="JSON {model_name: checkpoint_path}")
     parser.add_argument("--output", required=True)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--lr-selection", default=None,
+                        help="completed lr-selection artifact to consume "
+                             "without retuning (final runs)")
+    parser.add_argument("--save-lr-selection", default=None,
+                        help="write the tune-split lr selection as a "
+                             "completed artifact for the lock")
     args = parser.parse_args()
     config = load_config(args.config)
     protocol_id = None
+    protocol = None
     if args.protocol:
         protocol = C.load_protocol(args.protocol)
         C.verify_current_protocol(protocol, config, args.config,
@@ -311,36 +328,6 @@ def main():
     # any model. Shapes accepted unbatched or batched and normalized
     # to q0 [1,16,2], target [1,P,2], condition [1,514]. split and
     # checkpoint identity are retained (never dropped).
-    def _norm_q0(value, case_id):
-        arr = np.asarray(value, dtype=np.float64)
-        if arr.shape == (16, 2):
-            arr = arr.reshape(1, 16, 2)
-        if arr.shape != (1, 16, 2):
-            raise C.ProtocolError(
-                f"case {case_id}: q0 must be [16,2] or [1,16,2]; "
-                f"got {arr.shape}")
-        return arr
-
-    def _norm_target(value, case_id):
-        arr = np.asarray(value, dtype=np.float64)
-        if arr.ndim == 2 and arr.shape[1] == 2 and 0 < arr.shape[0] <= 16:
-            arr = arr.reshape(1, arr.shape[0], 2)
-        if not (arr.ndim == 3 and arr.shape[0] == 1
-                and arr.shape[2] == 2 and 0 < arr.shape[1] <= 16):
-            raise C.ProtocolError(
-                f"case {case_id}: target must be [P,2] or [1,P,2] "
-                f"with 0 < P <= 16; got {arr.shape}")
-        return arr
-
-    def _norm_cond(value, case_id):
-        arr = np.asarray(value, dtype=np.float64)
-        if arr.shape == (514,):
-            arr = arr.reshape(1, 514)
-        if arr.shape != (1, 514):
-            raise C.ProtocolError(
-                f"case {case_id}: condition must be [514] or [1,514]; "
-                f"got {arr.shape}")
-        return arr
 
     staged = []
     for raw in raw_cases:
@@ -359,9 +346,10 @@ def main():
         if missing:
             raise C.ProtocolError(f"correction case missing {missing}")
         case_id = str(raw["case_id"])
-        q0 = _norm_q0(raw["q0"], case_id)
-        target = _norm_target(raw["target"], case_id)
-        cond = _norm_cond(raw["condition"], case_id)
+        # Shared normalizer: identical arrays (and data_sha256) to the
+        # lock's eval manifest for the same inputs.
+        q0, target, cond = C.normalize_case_arrays(
+            raw["q0"], raw["target"], raw["condition"], case_id)
         checkpoint = str(raw["checkpoint"])
         if not os.path.exists(checkpoint):
             raise C.ProtocolError(
@@ -374,12 +362,25 @@ def main():
             scene=int(raw["scene"]), seed=int(raw["seed"]),
             model=str(raw["model"]), checkpoint=checkpoint,
             checkpoint_sha256=C.sha256_file(checkpoint),
+            data_sha256=C.case_data_sha256(q0, target, cond),
             q0_np=q0, target_np=target, cond_np=cond,
             q0_t=as_tensor(q0, device, "q0"),
             cond_t=as_tensor(cond, device, "condition"),
             target_t=as_tensor(target, device, "target")))
     with open(args.students) as handle:
         student_paths = json.load(handle)
+    # protocol/protocol_id were loaded at main entry; reuse them here.
+    # Audit 1344ed0 item 6: a correctly NAMED checkpoint must not enter
+    # the wrong comparison. Every loaded model is provenance-checked
+    # (arm, training seed, warm init, pair bank, updates, beta,
+    # protocol identity) before it corrects anything.
+    student_payloads = {}
+    for name, path in student_paths.items():
+        payload = torch.load(path, map_location=device, weights_only=True)
+        student_payloads[name] = payload
+        if protocol is not None:
+            C.verify_student_provenance(payload, protocol, config, path,
+                                        role="final")
     models = {name: load_student_model(path, device)
               for name, path in student_paths.items()}
     teacher = build_teacher(config, device)
@@ -413,7 +414,56 @@ def main():
     lr = args.lr
     tune_cases = [c for c in cases
                   if not c.get("unreachable") and c.get("split") == "tune"]
-    eval_cases = [c for c in cases if not c.get("unreachable")]
+    # Eval cases exclude tune: teacher-edit precomputation and row
+    # production never touch tuning cases.
+    eval_cases = [c for c in cases
+                  if not c.get("unreachable") and c.get("split") != "tune"]
+    tune_scenes = {c["scene"] for c in tune_cases}
+    tune_contexts = {c["context_id"] for c in tune_cases}
+    eval_scenes = {c["scene"] for c in eval_cases}
+    eval_contexts = {c["context_id"] for c in eval_cases}
+    if tune_cases and (tune_scenes & eval_scenes):
+        raise C.ProtocolError(
+            "tune/eval scene overlap: "
+            f"{sorted(tune_scenes & eval_scenes)[:5]}")
+    if tune_cases and (tune_contexts & eval_contexts):
+        raise C.ProtocolError(
+            "tune/eval context overlap: "
+            f"{sorted(tune_contexts & eval_contexts)[:5]}")
+    # Audit 1344ed0 item 6: lr comes from exactly one source. A locked
+    # selection is consumed without retuning; an explicit --lr must
+    # match the lock; otherwise tune once on the tune split and
+    # optionally save the selection artifact for the lock.
+    sel_artifact = None
+    if args.lr_selection is not None:
+        C.verify_completed(args.lr_selection)
+        with open(args.lr_selection) as handle:
+            sel_artifact = json.load(handle)
+        if sel_artifact.get("kind") != "lr_selection":
+            raise C.ProtocolError("lr-selection artifact has wrong kind")
+        if protocol is not None:
+            locked_sel = (protocol.get("design", {}).get("lr_selection")
+                          or {})
+            if locked_sel.get("sha256") != C.sha256_file(args.lr_selection):
+                raise C.ProtocolError(
+                    "lr-selection artifact differs from the locked "
+                    "selection; refusing to correct off-lock")
+        if lr is not None and float(lr) != float(sel_artifact["lr"]):
+            raise C.ProtocolError(
+                f"--lr {lr} != selection artifact {sel_artifact['lr']}")
+        lr = float(sel_artifact["lr"])
+        # The artifact's tune set, not this file's split strings,
+        # defines separation for the consumed selection.
+        tune_scenes = {int(s) for s in sel_artifact.get("tune_scenes", [])}
+        tune_contexts = {str(c)
+                         for c in sel_artifact.get("tune_contexts", [])}
+        if tune_scenes & eval_scenes:
+            raise C.ProtocolError(
+                "selection-artifact tune scenes overlap eval scenes")
+        if tune_contexts & eval_contexts:
+            raise C.ProtocolError(
+                "selection-artifact tune contexts overlap eval contexts")
+        lr_scores = None
     def _run():
         if lr is None:
             if not tune_cases:
@@ -425,8 +475,23 @@ def main():
                 trust_r=trust_r)
             print("frozen lr: " + json.dumps(dict(lr=chosen,
                                                   scores=lr_scores)))
+            if args.save_lr_selection is not None:
+                sel_path = args.save_lr_selection
+                C.reserve_outputs([sel_path])
+                C.write_meta(sel_path, dict(
+                    kind="lr_selection", lr=chosen, scores=lr_scores,
+                    tune_case_ids=sorted({c["case_id"]
+                                          for c in tune_cases}),
+                    tune_scenes=sorted(tune_scenes),
+                    tune_contexts=sorted(tune_contexts),
+                    protocol_id=protocol_id,
+                    config_sha256=C.sha256_file(args.config),
+                    source_hashes=C.source_hashes(),
+                    package_versions=C.package_versions()))
+                C.complete_output(sel_path, dict(lr=chosen))
+                print("wrote lr selection " + sel_path)
         else:
-            chosen = lr
+            chosen, lr_scores = lr, None
         rng = np.random.default_rng(C.stable_seed("correction", 0, 0, 0, 0))
         shared_offsets = random_search_offsets(
             rng, (1, 16, 2), n=64, trust_r=trust_r)

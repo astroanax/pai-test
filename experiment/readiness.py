@@ -116,10 +116,23 @@ def main():
     validity_ok = mean_invalid <= 0.10
     shared = C.readiness_gate(conventions, config["canonical_source"],
                               int(config["teacher_steps"]))
+    # Audit 1344ed0 item 7: ONE acceptance definition. The selected
+    # convention's own result decides; the old success-filtered
+    # `passing` list could be empty while the gate passed (score-only),
+    # crashing max() on an empty sequence. Score-only acceptance is
+    # labeled diagnostic_pilot and never authorizes the principal
+    # success-rate experiment.
+    structural_ok = bool(replicate_complete and complete_dev and coverage_ok
+                         and validity_ok)
+    mode = shared["mode"] if structural_ok else "fail"
+    # The accepted set IS the selected convention's replicate rows;
+    # nothing is filtered by a second predicate.
+    passing = list(selected) if mode != "fail" else []
     gate = dict(min_success=C.READINESS_MIN_SUCCESS,
                 min_score=C.READINESS_MIN_SCORE,
                 min_coverage_scenes=MIN_COVERAGE_SCENES,
                 max_invalid_rate=0.10,
+                acceptance_mode=mode,
                 selected=dict(source=config["canonical_source"],
                               steps=int(config["teacher_steps"]),
                               replicates=expected_reps,
@@ -127,20 +140,18 @@ def main():
                               scenes_complete=complete_dev,
                               coverage_ok=coverage_ok,
                               validity_ok=validity_ok,
-                              mean_invalid_rate=mean_invalid),
+                              mean_invalid_rate=mean_invalid,
+                              success=shared["success"],
+                              score=shared["score"]),
                 shared_gate=shared)
-    passing = [c for c in conventions
-               if c["success"] >= C.READINESS_MIN_SUCCESS
-               and c["coverage_scenes"] >= MIN_COVERAGE_SCENES]
-    passed = bool(replicate_complete and complete_dev and coverage_ok
-                  and validity_ok and shared["passed"])
+    passed = bool(mode == "principal")
     report = dict(kind="teacher_readiness", schema_version=SCHEMA_VERSION,
                   config_sha256=sha256_file(args.config),
                   checkpoint_sha256=sha256_file(config["checkpoint"]),
                   source_hashes=source_hashes(),
                   package_versions=package_versions(),
                   conventions=conventions, gate=gate,
-                  passed=passed,
+                  passed=passed, acceptance_mode=mode,
                   passing=[c["name"] for c in passing],
                   compute=C.compute_env(config.get("device", "cuda")))
     reserve_outputs([args.output])
@@ -148,12 +159,25 @@ def main():
     complete_output(args.output, dict(conventions=len(conventions)))
     if not passed:
         raise ProtocolError(
-            "readiness gate failed: no convention reached success >= "
-            f"{GATE_SUCCESS} with coverage >= {MIN_COVERAGE_SCENES} scenes; "
-            "do not train students")
-    best = max(passing, key=lambda c: (c["success"], c["score"]))
-    print("readiness best: " + json.dumps({k: best[k] for k in
-          ("name", "source", "steps", "success", "score", "coverage_scenes")}))
+            "readiness gate failed: the selected "
+            f"({config['canonical_source']}, "
+            f"{int(config['teacher_steps'])}) convention did not reach "
+            f"acceptance_mode=principal (got {mode}; "
+            f"success {shared['success']:.3f} >= {GATE_SUCCESS}, or "
+            f"score-only diagnostic_pilot). Do not train students for "
+            "the principal experiment.")
+    # Best is the selected convention's aggregate, never max() over a
+    # separately filtered list (which could be empty on a score-only
+    # pass and crash).
+    best = dict(name=f"{config['canonical_source']}_"
+                     f"{int(config['teacher_steps'])}",
+                source=config["canonical_source"],
+                steps=int(config["teacher_steps"]),
+                success=shared["success"], score=shared["score"],
+                coverage_scenes=len(
+                    {r["scene"] for r in pooled if r["success"]}),
+                acceptance_mode=mode)
+    print("readiness best: " + json.dumps(best))
     print("wrote readiness " + args.output)
     return 0
 
